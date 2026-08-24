@@ -484,14 +484,14 @@ Scan for AirSense 11
 </div>
 </div>
 
-<!-- Wellue/Viatom O2 Ring S -->
+<!-- Wellue/Viatom Pulse Oximeter (O2S / Legacy rings) -->
 <div class="card" style="display:flex;flex-direction:column;justify-content:space-between">
 <div>
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
-Wellue/Viatom O2 Ring S Pulse Oximeter
+Wellue/Viatom Pulse Oximeter
 </div>
-<p class="card-desc">Pair over Bluetooth to sync pulse oximetry data (SpO₂, heart rate) recorded during sleep.</p>
+<p class="card-desc">Pair over Bluetooth to sync pulse oximetry data (SpO₂, heart rate) recorded during sleep. Supports the O2 Ring S / SleepHQ Pro (OxyII protocol) and legacy P02 / O2Ring devices.</p>
 <div class="form-group">
 <div id="ox-paired" class="ble-status-paired" style="display:none">
 <span class="paired-badge">● Paired</span> with <strong id="ox-dev-name">O2 Ring</strong>
@@ -500,7 +500,7 @@ Wellue/Viatom O2 Ring S Pulse Oximeter
 <div id="ox-unpaired">
 <button class="btn btn-outline btn-sm" type="button" onclick="oxScan()">
 <svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M17.65 6.35A7.96 7.96 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
-Scan for O2 Ring
+Scan for Oximeter Ring
 </button>
 <div class="form-group" id="ox-select-group" style="display:none;margin-top:10px">
 <label>Select Device</label>
@@ -952,6 +952,20 @@ Upload Progress
 
 <div class="status-grid">
 <div class="card info-list">
+<div class="card-title">Oximeter</div>
+<div class="info-row"><span class="info-label">Status</span><span class="info-value" id="ox2-state">--</span></div>
+<div class="info-row"><span class="info-label">Device</span><span class="info-value" id="ox2-device">--</span></div>
+<div class="info-row"><span class="info-label">Protocol</span><span class="info-value" id="ox2-proto">--</span></div>
+<div class="info-row"><span class="info-label">Serial</span><span class="info-value" id="ox2-serial">--</span></div>
+<div class="info-row"><span class="info-label">Model</span><span class="info-value" id="ox2-model">--</span></div>
+<div class="info-row"><span class="info-label">Battery</span><span class="info-value" id="ox2-battery">--</span></div>
+<div class="info-row"><span class="info-label">Recordings on ring</span><span class="info-value" id="ox2-files">--</span></div>
+<div class="info-row"><span class="info-label">Last sync</span><span class="info-value" id="ox2-sync">--</span></div>
+<div class="info-row"><span class="info-label">Firmware</span><span class="info-value" id="ox2-fw">--</span></div>
+<div class="info-row"><span class="info-label">Address</span><span class="info-value" id="ox2-addr">--</span></div>
+<div class="info-row" id="ox2-error-row" style="display:none"><span class="info-label">Error</span><span class="info-value" id="ox2-error">--</span></div>
+</div>
+<div class="card info-list">
 <div class="card-title">System Status</div>
 <div class="info-row"><span class="info-label">Firmware</span><span class="info-value" id="status-fw">--</span></div>
 <div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="status-uptime">--</span></div>
@@ -962,7 +976,6 @@ Upload Progress
 <div class="info-row"><span class="info-label">NTP Sync</span><span class="info-value" id="status-ntp">--</span></div>
 <div class="info-row"><span class="info-label">SD Card Free</span><span class="info-value" id="status-sd">--</span></div>
 <div class="info-row"><span class="info-label">Paired data source</span><span class="info-value" id="status-ble">--</span></div>
-<div class="info-row"><span class="info-label">O2 Ring</span><span class="info-value" id="status-ox">--</span></div>
 <div class="info-row"><span class="info-label">WiFi RSSI</span><span class="info-value" id="status-rssi">--</span></div>
 </div>
 <div class="card info-list">
@@ -1693,22 +1706,47 @@ function loadStatusTab(d) {
     bleEl.style.color = colors[st] || 'var(--text-muted)';
   }
 
-  /* Oximeter (O2 Ring) status */
-  var oxEl = document.getElementById('status-ox');
-  if (oxEl) {
-    var ox = d.oximeter || {};
-    var ost = ox.state || 'idle';
-    var olabels = {
-      'idle': 'Not paired', 'scanning': 'Scanning…', 'connecting': 'Connecting…',
-      'pulling': 'Syncing…', 'paired': (ox.device && ox.device.serial) ? ox.device.serial : 'Paired', 'error': 'Error'
-    };
-    var ocolors = {
-      'idle': 'var(--text-muted)', 'scanning': 'var(--warning)', 'connecting': 'var(--warning)',
-      'pulling': 'var(--warning)', 'paired': 'var(--success)', 'error': 'var(--danger)'
-    };
-    oxEl.textContent = olabels[ost] || ost;
-    oxEl.style.color = ocolors[ost] || 'var(--text-muted)';
+  /* Oximeter status card */
+  var ox = d.oximeter || {};
+  var dv = ox.device || {};
+  var ost = ox.state || 'idle';
+  var olabels = {
+    'idle': 'Not paired', 'scanning': 'Scanning…', 'connecting': 'Connecting…',
+    'pulling': 'Syncing…', 'paired': 'Paired', 'error': 'Error'
+  };
+  var ocolors = {
+    'idle': 'var(--text-muted)', 'scanning': 'var(--warning)', 'connecting': 'var(--warning)',
+    'pulling': 'var(--warning)', 'paired': 'var(--success)', 'error': 'var(--danger)'
+  };
+  var stEl = document.getElementById('ox2-state');
+  if (stEl) {
+    stEl.textContent = olabels[ost] || ost;
+    stEl.style.color = ocolors[ost] || 'var(--text-muted)';
   }
+  setEl('ox2-device', ox.paired ? oxDeviceName(dv) : '--');
+  setEl('ox2-proto', ox.paired ? (dv.protocol || '--') : '--');
+  setEl('ox2-serial', ox.paired ? (dv.serial || '--') : '--');
+  setEl('ox2-model', (ox.paired && dv.model) ? dv.model : '--');
+  setEl('ox2-battery', (ox.paired && typeof dv.battery === 'number' && dv.battery >= 0) ? (dv.battery + '%') : '--');
+  setEl('ox2-files', (ox.paired && typeof dv.files_on_ring === 'number' && dv.files_on_ring >= 0) ? dv.files_on_ring : '--');
+  if (ox.paired && dv.last_sync) {
+    var age = Math.max(0, (Date.now() / 1000) - dv.last_sync);
+    var ago;
+    if (age < 90) ago = Math.round(age) + 's ago';
+    else if (age < 5400) ago = Math.round(age / 60) + ' min ago';
+    else if (age < 172800) ago = Math.round(age / 3600) + ' h ago';
+    else ago = Math.round(age / 86400) + ' d ago';
+    var pulledTxt = (typeof dv.last_pulled === 'number' && dv.last_pulled >= 0) ? (' · ' + dv.last_pulled + ' file(s)') : '';
+    setEl('ox2-sync', ago + pulledTxt);
+  } else {
+    setEl('ox2-sync', ox.paired ? 'never this boot' : '--');
+  }
+  setEl('ox2-fw', (ox.paired && dv.firmware) ? dv.firmware : '--');
+  setEl('ox2-addr', (ox.paired && dv.addr) ? dv.addr : '--');
+  var errRow = document.getElementById('ox2-error-row');
+  if (errRow) errRow.style.display = (ost === 'error' && ox.error) ? '' : 'none';
+  if (ost === 'error') setEl('ox2-error', ox.error || '--');
+
   /* Also update the pairing card UI */
   updateOxUI(d.oximeter);
 
@@ -1983,6 +2021,13 @@ function oxScan() {
   }).catch(function() { oxStatusMsg('Scan failed'); });
 }
 
+/* Human-readable name for a paired oximeter, by protocol backend. */
+function oxDeviceName(dv) {
+  if (dv && dv.protocol === 'legacy') return 'Legacy Wellue O2 Ring';
+  if (dv && dv.protocol === 'oxyii') return 'O2S (OxyII) Ring';
+  return (dv && dv.protocol) ? dv.protocol : 'Oximeter Ring';
+}
+
 function oxPair() {
   var addr = document.getElementById('ox-dev').value;
   if (!addr) { oxStatusMsg('Select a device first'); return; }
@@ -1998,9 +2043,10 @@ function oxForget() {
 
 function oxPoll() {
   if (oxPollTimer) clearInterval(oxPollTimer);
-  oxPollTimer = setInterval(function() {
-    if (!appWs || appWs.readyState !== WebSocket.OPEN) oxRefresh();
-  }, 5000);
+  /* Poll unconditionally: the WS channel pushes status too, but a
+   * half-open socket must never freeze this card — HTTP is cheap and
+   * updateOxUI() stops the timer once a steady state is reached. */
+  oxPollTimer = setInterval(oxRefresh, 5000);
   oxRefresh();
 }
 
@@ -2025,8 +2071,16 @@ function updateOxUI(ox) {
     if (fgt) fgt.style.display = '';
     var dn = document.getElementById('ox-dev-name');
     var di = document.getElementById('ox-dev-info');
-    if (dn) dn.textContent = (ox.device && ox.device.name_prefix) ? (ox.device.name_prefix + ' O2 Ring') : 'O2 Ring';
-    if (di && ox.device) di.textContent = 'S/N: ' + (ox.device.serial || '--') + '  FW: ' + (ox.device.firmware || '--');
+    var dv = ox.device || {};
+    if (dn) dn.textContent = oxDeviceName(dv);
+    if (di && ox.device) {
+      var bits = [];
+      if (dv.serial) bits.push('S/N: ' + dv.serial);
+      if (dv.model) bits.push('Model: ' + dv.model);
+      if (typeof dv.battery === 'number' && dv.battery >= 0) bits.push('Battery: ' + dv.battery + '%');
+      if (dv.firmware) bits.push('FW: ' + dv.firmware);
+      di.textContent = bits.join(' · ');
+    }
     if (ox.state === 'connecting') { oxStatusMsg('Syncing…'); }
     else if (ox.state === 'pulling') { oxStatusMsg('Syncing…'); }
     else if (ox.state === 'scanning') { oxStatusMsg('Scanning…'); }

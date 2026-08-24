@@ -26,6 +26,8 @@
  */
 
 #include "oximeter.h"
+#include "oximeter_store.h"
+#include "oximeter_legacy.h"
 #include "sd_storage.h"
 #include "as11_ble.h"
 #include "psram_task.h"
@@ -56,23 +58,6 @@
 #include "host/util/util.h"
 
 static const char *TAG = "oximeter";
-
-/* ── Store forward declarations (oximeter_store.c) ─────────────────── */
-void ox_store_ensure_dirs(void);
-bool ox_store_load_paired(char *serial, size_t serial_sz,
-                          char *firmware, size_t fw_sz,
-                          char *name_prefix, size_t prefix_sz,
-                          char *last_addr, size_t addr_sz);
-void ox_store_save_paired(const char *serial, const char *firmware,
-                          const char *name_prefix, const char *last_addr);
-void ox_store_delete_paired(void);
-int  ox_store_index_check(const char *serial, const char *name);
-void ox_store_index_add(const char *serial, const char *name,
-                        uint32_t bytes, bool finalised);
-long ox_store_part_size(const char *name);
-esp_err_t ox_store_part_append(const char *name, const uint8_t *data, size_t len);
-bool ox_store_promote(const char *serial, const char *name);
-void ox_store_part_remove(const char *name);
 
 /* ── OxyII protocol constants ──────────────────────────────────────── */
 #define OXYII_LEAD         0xA5
@@ -214,7 +199,9 @@ static void oxyii_time_payload(uint8_t *out8)
 static void oxyii_file_start_payload(uint8_t *out20, const char *name)
 {
     memset(out20, 0, 20);
-    strncpy((char *)out20, name, 16);
+    size_t n = strlen(name);
+    if (n > 16) n = 16;
+    memcpy(out20, name, n);
     /* bytes 16..19: file type = 0 */
 }
 
@@ -235,6 +222,7 @@ struct ox_scan_result {
     char name[32];
     int rssi;
     uint16_t mfg;
+    const char *proto;      /* OX_PROTO_* — which backend owns this device */
 };
 
 static SemaphoreHandle_t s_state_mtx;
@@ -254,19 +242,29 @@ static char s_serial[32];
 static char s_firmware[16];
 static char s_name_prefix[16];
 static char s_paired_addr[18];
+static const char *s_protocol = OX_PROTO_OXYII;
 static bool s_paired = false;
 static bool s_presence_served = false;
 static bool s_ring_present = false;
 static TickType_t s_served_at;
 static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window */
+static int s_legacy_fail_count = 0; /* consecutive legacy-ring session failures */
+static time_t s_last_sync_time = 0; /* epoch of last completed sync, 0=never */
+static int s_last_pulled = -1;   /* recordings pulled in that sync */
+static int s_absent_streak = 0;  /* consecutive scans with no paired-protocol hit */
 
 /* Measured: END powers off ~120s after take-off IF no one connects.
  * Any GATT connection resets that timer. Pull happens inside the
- * window, so after a pull: never reconnect while the advert lasts.
- * Still advertising at pull+130s can only mean re-worn. */
-#define OX_END_WINDOW_MS  130000
+ * window, so after a pull: never reconnect while the ring lasts.
+ * Sleep guarantee: after a served session, NO connections happen while
+ * the ring stays visible — a docked/charging legacy ring advertises
+ * forever, so only true radio-silence (slept/worn/out-of-range) or a
+ * long timeout reopens the sync window. */
+#define OX_ABSENT_STRIKES      4    /* consecutive empty scans = gone (~60s) */
+#define OX_SERVED_REPROBE_MS   (30ul * 60 * 1000) /* visibility safety valve */
 #define OX_WORN_PROBE_MS  60000  /* LIVE_B interval while worn; END lasts ~120s */
 #define OX_F1_MAX_RETRIES 3      /* give up on F1 after N consecutive timeouts */
+#define OX_LEGACY_MAX_FAILS  3   /* stop hammering a legacy ring that won't sync */
 
 /* BLE connection state */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -279,6 +277,7 @@ static uint8_t s_seq = 0;
 /* Scan state */
 static struct ox_scan_result s_scan[OX_SCAN_MAX];
 static int s_scan_count;
+static volatile uint32_t s_adv_seen;    /* raw adverts received this scan */
 
 /* Notification accumulation buffer */
 static uint8_t s_resp_buf[OXYII_MAX_FRAME];
@@ -291,8 +290,11 @@ static int s_resp_payload_len;
 static void set_state(const char *st)
 {
     xSemaphoreTake(s_state_mtx, portMAX_DELAY);
+    bool changed = strcmp(s_status, st) != 0;
     strlcpy(s_status, st, sizeof(s_status));
     xSemaphoreGive(s_state_mtx);
+    if (changed)
+        ESP_LOGI(TAG, "state -> %s", st);
 }
 
 static void set_error(const char *fmt, ...)
@@ -387,6 +389,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISC: {
         char addr_str[18];
         addr_to_str(&event->disc.addr, addr_str, sizeof(addr_str));
+        s_adv_seen++;
 
         /* Parse name from adv data (with manual fallback) */
         struct ble_hs_adv_fields f;
@@ -424,12 +427,32 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (f.mfg_data && f.mfg_data_len >= 2)
             cid = f.mfg_data[0] | (f.mfg_data[1] << 8);
 
-        /* Recording-mode advert (on-finger): never a pull candidate. */
+        /* Recording-mode advert (on-finger): never a pull candidate.
+         * (OxyII-family mfg id; legacy rings don't use it.) */
         if (cid == MFG_RECORDING)
             return 0;
 
-        bool match = name_is_oxyii(name) || cid == MFG_OXYII;
-        if (!match) return 0;
+        /* Classify protocol.  Both families are Viatom-made and share
+         * manufacturer id 0xF34E, so an explicit legacy-ring family
+         * name must win over the mfg-id heuristic.  Names decide
+         * first; ids/service UUIDs only break ties when unnamed. */
+        const char *proto = NULL;
+        if (legacy_name_match(name))
+            proto = OX_PROTO_LEGACY;
+        else if (name_is_oxyii(name) || cid == MFG_OXYII)
+            proto = OX_PROTO_OXYII;
+        else if (legacy_adv_service_match(raw, raw_len))
+            proto = OX_PROTO_LEGACY;
+        if (!proto) {
+            /* Not an oximeter we handle — DEBUG keeps the RF picture
+             * without flooding INFO. */
+            ESP_LOGD(TAG, "scan: ignoring '%s' rssi=%d addr=%s mfg=0x%04x",
+                     name[0] ? name : "-", event->disc.rssi, addr_str, cid);
+            return 0;
+        }
+        ESP_LOGD(TAG, "scan: classified '%s' -> %s (name/mfg=0x%04x)",
+                 name[0] ? name : "-", proto, cid);
+
         if (name[0] == '\0')
             strlcpy(name, "O2Ring", sizeof(name));
 
@@ -439,6 +462,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                        sizeof(ble_addr_t)) == 0) {
                 s_scan[i].rssi = event->disc.rssi;
                 s_scan[i].mfg = cid;
+                s_scan[i].proto = proto;
                 if (name[0] && strncmp(name, "O2Ring", 6) != 0)
                     strlcpy(s_scan[i].name, name, sizeof(s_scan[i].name));
                 return 0;
@@ -450,9 +474,10 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                     sizeof(s_scan[s_scan_count].name));
             s_scan[s_scan_count].rssi = event->disc.rssi;
             s_scan[s_scan_count].mfg = cid;
+            s_scan[s_scan_count].proto = proto;
             s_scan_count++;
-            ESP_LOGD(TAG, "scan: '%s' rssi=%d addr=%s mfg=0x%04x",
-                     name, event->disc.rssi, addr_str, cid);
+            ESP_LOGI(TAG, "scan: '%s' rssi=%d addr=%s mfg=0x%04x proto=%s",
+                     name, event->disc.rssi, addr_str, cid, proto);
         }
         return 0;
     }
@@ -895,6 +920,7 @@ struct ox_nvs_arg {
     char firmware[16];
     char name_prefix[16];
     char last_addr[18];
+    char protocol[12];
 };
 
 static esp_err_t do_save_nvs(void *arg)
@@ -907,6 +933,8 @@ static esp_err_t do_save_nvs(void *arg)
     nvs_set_str(h, "firmware", a->firmware);
     nvs_set_str(h, "name_prefix", a->name_prefix);
     nvs_set_str(h, "last_addr", a->last_addr);
+    nvs_set_str(h, "protocol",
+                a->protocol[0] ? a->protocol : OX_PROTO_OXYII);
     e = nvs_commit(h);
     nvs_close(h);
     return e;
@@ -922,46 +950,81 @@ static esp_err_t do_erase_nvs(void *arg)
     nvs_erase_key(h, "firmware");
     nvs_erase_key(h, "name_prefix");
     nvs_erase_key(h, "last_addr");
+    nvs_erase_key(h, "protocol");
     e = nvs_commit(h);
     nvs_close(h);
     return e;
 }
 
+/* Map a persisted protocol string onto the OX_PROTO_* literal. */
+static const char *proto_from_str(const char *s)
+{
+    if (!s || s[0] == '\0') return OX_PROTO_OXYII;
+    /* "o2ring" = records written before the backend was renamed. */
+    if (strcmp(s, OX_PROTO_LEGACY) == 0 || strcmp(s, "o2ring") == 0)
+        return OX_PROTO_LEGACY;
+    return OX_PROTO_OXYII;
+}
+
 static void load_paired_from_nvs(void)
 {
     nvs_handle_t h;
-    if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
-    size_t len;
+    if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len;
+        char serial[32] = {0}, fw[16] = {0}, prefix[16] = {0},
+             addr[18] = {0}, proto[12] = {0};
 
-    len = sizeof(s_serial);
-    if (nvs_get_str(h, "serial", s_serial, &len) == ESP_OK && s_serial[0]) {
-        s_paired = true;
-        len = sizeof(s_firmware);
-        nvs_get_str(h, "firmware", s_firmware, &len);
-        len = sizeof(s_name_prefix);
-        nvs_get_str(h, "name_prefix", s_name_prefix, &len);
-        len = sizeof(s_paired_addr);
-        nvs_get_str(h, "last_addr", s_paired_addr, &len);
-    }
-    nvs_close(h);
+        len = sizeof(serial);
+        if (nvs_get_str(h, "serial", serial, &len) == ESP_OK && serial[0]) {
+            len = sizeof(fw);     nvs_get_str(h, "firmware", fw, &len);
+            len = sizeof(prefix); nvs_get_str(h, "name_prefix", prefix, &len);
+            len = sizeof(addr);   nvs_get_str(h, "last_addr", addr, &len);
+            len = sizeof(proto);  nvs_get_str(h, "protocol", proto, &len);
 
-    /* Also try loading from paired.json (SD) as fallback */
-    if (!s_paired) {
-        char serial[32], fw[16], prefix[16], addr[18];
-        if (ox_store_load_paired(serial, sizeof(serial),
-                                 fw, sizeof(fw),
-                                 prefix, sizeof(prefix),
-                                 addr, sizeof(addr))) {
             strlcpy(s_serial, serial, sizeof(s_serial));
             strlcpy(s_firmware, fw, sizeof(s_firmware));
             strlcpy(s_name_prefix, prefix, sizeof(s_name_prefix));
             strlcpy(s_paired_addr, addr, sizeof(s_paired_addr));
+            s_protocol = proto_from_str(proto);
+            s_paired = true;
+        }
+        nvs_close(h);
+    }
+
+    /* Also try loading from paired.json (SD) as fallback */
+    if (!s_paired) {
+        char serial[32], fw[16], prefix[16], addr[18], proto[12] = {0};
+        if (ox_store_load_paired(serial, sizeof(serial),
+                                 fw, sizeof(fw),
+                                 prefix, sizeof(prefix),
+                                 addr, sizeof(addr),
+                                 proto, sizeof(proto))) {
+            strlcpy(s_serial, serial, sizeof(s_serial));
+            strlcpy(s_firmware, fw, sizeof(s_firmware));
+            strlcpy(s_name_prefix, prefix, sizeof(s_name_prefix));
+            strlcpy(s_paired_addr, addr, sizeof(s_paired_addr));
+            s_protocol = proto_from_str(proto);
             s_paired = true;
         }
     }
 }
 
 /* ── Pair task ─────────────────────────────────────────────────────── */
+static esp_err_t do_scan(int timeout_sec, bool active);
+
+/* Protocol for an address as classified by the most recent scan.
+ * Returns NULL if the address is not in the scan cache. */
+static const char *scan_proto_for_addr(const char *addr_str)
+{
+    for (int i = 0; i < s_scan_count; i++) {
+        char a[18];
+        addr_to_str(&s_scan[i].addr, a, sizeof(a));
+        if (strcmp(a, addr_str) == 0 && s_scan[i].proto)
+            return s_scan[i].proto;
+    }
+    return NULL;
+}
+
 static void pair_task(void *arg)
 {
     char *addr_str = (char *)arg;
@@ -972,6 +1035,69 @@ static void pair_task(void *arg)
 
     if (!parse_addr(addr_str, &target)) {
         set_error("invalid address: %s", addr_str);
+        free(addr_str);
+        xSemaphoreGive(s_ops_mtx);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Protocol comes from how this address advertised during the last
+     * scan (the UI always scans before listing).  The background watch
+     * rebuilds that cache every cycle, so the entry may have been
+     * evicted between listing and tapping Pair — re-scan actively once
+     * before giving up.  Unknown addresses fall back to the existing
+     * OxyII flow. */
+    const char *proto = scan_proto_for_addr(addr_str);
+    if (!proto) {
+        ESP_LOGI(TAG, "pair: '%s' not in scan cache — rescanning", addr_str);
+        do_scan(4, true);
+        proto = scan_proto_for_addr(addr_str);
+        ESP_LOGI(TAG, "rescan found %d device(s)", s_scan_count);
+    }
+    if (!proto) proto = OX_PROTO_OXYII;
+    ESP_LOGI(TAG, "pairing %s device at %s", proto, addr_str);
+
+    /* ── Legacy-ring (P02/O2Ring) pairing: session connects, reads INFO
+     * and disconnects internally.  Identify-only — recordings are pulled by
+     * the background sync right afterwards. ── */
+    if (strcmp(proto, OX_PROTO_LEGACY) == 0) {
+        char serial[32] = {0};
+        int pulled = 0;
+        legacy_sync_err_t r = legacy_sync_session(&target, NULL, false,
+                                                  serial, sizeof(serial),
+                                                  &pulled);
+        if (r != LEGACY_SYNC_OK || serial[0] == '\0') {
+            set_error("legacy identify failed (%d)", r);
+            free(addr_str);
+            xSemaphoreGive(s_ops_mtx);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        char prefix[5];
+        snprintf(prefix, sizeof(prefix), "%.4s", serial);
+
+        struct ox_nvs_arg nvs_arg;
+        memset(&nvs_arg, 0, sizeof(nvs_arg));
+        strlcpy(nvs_arg.serial, serial, sizeof(nvs_arg.serial));
+        strlcpy(nvs_arg.name_prefix, prefix, sizeof(nvs_arg.name_prefix));
+        strlcpy(nvs_arg.last_addr, addr_str, sizeof(nvs_arg.last_addr));
+        strlcpy(nvs_arg.protocol, OX_PROTO_LEGACY, sizeof(nvs_arg.protocol));
+        nvs_writer_run(do_save_nvs, &nvs_arg);
+
+        ox_store_save_paired(serial, "", prefix, addr_str, OX_PROTO_LEGACY);
+
+        strlcpy(s_serial, serial, sizeof(s_serial));
+        s_firmware[0] = '\0';
+        strlcpy(s_name_prefix, prefix, sizeof(s_name_prefix));
+        strlcpy(s_paired_addr, addr_str, sizeof(s_paired_addr));
+        s_protocol = OX_PROTO_LEGACY;
+        s_paired = true;
+        s_presence_served = false;
+
+        set_state(OX_STATUS_PAIRED);
+        ESP_LOGI(TAG, "paired legacy ring: serial=%s", serial);
+
         free(addr_str);
         xSemaphoreGive(s_ops_mtx);
         vTaskDelete(NULL);
@@ -1021,14 +1147,16 @@ static void pair_task(void *arg)
 
     /* Save to NVS */
     struct ox_nvs_arg nvs_arg;
+    memset(&nvs_arg, 0, sizeof(nvs_arg));
     strlcpy(nvs_arg.serial, serial, sizeof(nvs_arg.serial));
     strlcpy(nvs_arg.firmware, firmware, sizeof(nvs_arg.firmware));
     strlcpy(nvs_arg.name_prefix, prefix, sizeof(nvs_arg.name_prefix));
     strlcpy(nvs_arg.last_addr, addr_str, sizeof(nvs_arg.last_addr));
+    strlcpy(nvs_arg.protocol, OX_PROTO_OXYII, sizeof(nvs_arg.protocol));
     nvs_writer_run(do_save_nvs, &nvs_arg);
 
     /* Save to paired.json on SD */
-    ox_store_save_paired(serial, firmware, prefix, addr_str);
+    ox_store_save_paired(serial, firmware, prefix, addr_str, OX_PROTO_OXYII);
 
     /* Update in-RAM state */
     strlcpy(s_serial, serial, sizeof(s_serial));
@@ -1047,33 +1175,59 @@ static void pair_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* ── Low-duty OxyII scan (caller holds s_ops_mtx) ──────────────────── */
-static esp_err_t do_scan(int timeout_sec)
+/* ── Scan (caller holds s_ops_mtx) ───────────────────────────────────
+ * passive: low-duty listen-only for the background watch.  active:
+ * full-duty with scan requests — needed to pull names/UUIDs from scan
+ * responses when classifying a device for pairing.
+ * Note: NimBLE runs a single discovery procedure host-wide.  An AS11
+ * scan (as11_ble_scan) started while this runs — or vice versa — makes
+ * the loser fail with BLE_HS_EBUSY; the modules share the radio but
+ * not a mutex. */
+static esp_err_t do_scan(int timeout_sec, bool active)
 {
     s_scan_count = 0;
+    s_adv_seen = 0;
 
     struct ble_gap_disc_params dp = {
-        .itvl = 160,   /* 100 ms */
-        .window = 48,  /* 30 ms  — low duty; pairing scan uses 96/96 */
+        .itvl = active ? 96 : 160,
+        .window = active ? 96 : 48,   /* active = pairing duty (96/96) */
         .filter_policy = 0,
         .limited = 0,
-        .passive = 1,  /* watch is listen-only; no scan requests */
+        .passive = !active,           /* watch is listen-only */
     };
+    ESP_LOGI(TAG, "%s scan (%ds, %ums/%ums window): start",
+             active ? "active" : "passive", timeout_sec,
+             dp.itvl * 625 / 1000, dp.window * 625 / 1000);
 
     uint8_t own_addr_type;
     int rc = ble_hs_id_infer_auto(BLE_ADDR_RANDOM, &own_addr_type);
     if (rc != 0) own_addr_type = as11_ble_get_own_addr_type();
 
+    TickType_t t0 = xTaskGetTickCount();
     while (xSemaphoreTake(s_scan_done, 0) == pdTRUE) { }
 
     rc = ble_gap_disc(own_addr_type,
                       timeout_sec * 1000, &dp, gap_event, NULL);
     if (rc != 0) {
-        ESP_LOGW(TAG, "scan start failed: %d", rc);
+        if (rc == BLE_HS_EBUSY)
+            ESP_LOGW(TAG, "scan start failed: BUSY (AS11 scan running? "
+                          "only one BLE discovery at a time)");
+        else
+            ESP_LOGW(TAG, "scan start failed: %d", rc);
         return ESP_FAIL;
     }
 
-    xSemaphoreTake(s_scan_done, pdMS_TO_TICKS((timeout_sec + 2) * 1000));
+    bool done = xSemaphoreTake(s_scan_done,
+                               pdMS_TO_TICKS((timeout_sec + 2) * 1000)) == pdTRUE;
+    ESP_LOGI(TAG, "%s scan done after %lus: %d matched device(s), "
+             "%lu raw advert(s)%s",
+             active ? "active" : "passive",
+             (unsigned long)((xTaskGetTickCount() - t0) / configTICK_RATE_HZ),
+             s_scan_count, (unsigned long)s_adv_seen,
+             done ? "" : " (timeout)");
+    /* Many adverts + zero matches usually means RF/coexistence trouble
+     * (Wi-Fi starving BLE) or an unclassified device — check DEBUG
+     * 'ignoring' lines.  Few adverts means the radio barely listened. */
     return ESP_OK;
 }
 
@@ -1108,49 +1262,129 @@ static void pull_task(void *arg)
             continue;
         }
 
-        if (do_scan(4) != ESP_OK) {
+        if (do_scan(4, false) != ESP_OK) {
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
 
-        if (s_scan_count == 0) {
-            if (s_ring_present)
-                ESP_LOGI(TAG, "ring gone — next appearance is a new sync window");
-            s_ring_present = false;
-            if (s_presence_served)
-                s_presence_served = false;
-            s_f1_fail_count = 0;
+        /* Pick the first scan hit belonging to the paired protocol.
+         * Adverts from the other protocol family are ignored. */
+        int ti = -1;
+        int n_ox = 0, n_leg = 0;
+        for (int i = 0; i < s_scan_count; i++) {
+            if (s_scan[i].proto) {
+                if (strcmp(s_scan[i].proto, OX_PROTO_OXYII) == 0) n_ox++;
+                else if (strcmp(s_scan[i].proto, OX_PROTO_LEGACY) == 0) n_leg++;
+            }
+            if (ti < 0 && s_scan[i].proto &&
+                strcmp(s_scan[i].proto, s_protocol) == 0) {
+                ti = i;
+            }
+        }
+        ESP_LOGD(TAG, "watch: scan %d hit(s): oxyii=%d legacy=%d paired=%s",
+                 s_scan_count, n_ox, n_leg, s_protocol);
+        for (int i = 0; i < s_scan_count; i++) {
+            char a[18];
+            addr_to_str(&s_scan[i].addr, a, sizeof(a));
+            ESP_LOGD(TAG, "watch: hit[%d] '%s' rssi=%d addr=%s proto=%s",
+                     i, s_scan[i].name[0] ? s_scan[i].name : "-",
+                     s_scan[i].rssi, a,
+                     s_scan[i].proto ? s_scan[i].proto : "-");
+        }
+        if (ti < 0) {
+            /* Passive scans miss adverts under Wi-Fi coexistence —
+             * require several consecutive empty scans before declaring
+             * the ring gone, otherwise unlucky misses would break the
+             * post-sync silence and keep resetting the ring's sleep
+             * timer. */
+            s_absent_streak++;
+            ESP_LOGD(TAG, "watch: no device matches paired protocol '%s' (absent streak %d/%d)",
+                     s_protocol, s_absent_streak, OX_ABSENT_STRIKES);
+            if (s_absent_streak >= OX_ABSENT_STRIKES) {
+                if (s_ring_present)
+                    ESP_LOGI(TAG, "ring gone — next appearance is a new sync window");
+                s_ring_present = false;
+                if (s_presence_served)
+                    s_presence_served = false;
+                s_f1_fail_count = 0;
+                s_legacy_fail_count = 0;
+            }
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
+        s_absent_streak = 0;
 
         if (!s_ring_present) {
             ESP_LOGI(TAG, "ring present: '%s' rssi=%d",
-                     s_scan[0].name, s_scan[0].rssi);
+                     s_scan[ti].name, s_scan[ti].rssi);
             s_ring_present = true;
         }
 
         /* Remember last seen addr (hint; MAC can rotate on factory reset). */
-        addr_to_str(&s_scan[0].addr, s_paired_addr, sizeof(s_paired_addr));
+        addr_to_str(&s_scan[ti].addr, s_paired_addr, sizeof(s_paired_addr));
 
         if (s_presence_served) {
-            /* Never reconnect during END — a connection resets the
-             * ring's power-off timer (measured). Passive scans only.
-             * Still advertising past the longest possible END window
-             * (take-off + ~120s; pull ran inside it) ⇒ back on a
-             * finger ⇒ clear served so the next take-off pulls. */
-            if ((xTaskGetTickCount() - s_served_at) < pdMS_TO_TICKS(OX_END_WINDOW_MS)) {
+            /* Post-sync connection curfew.  While the ring stays
+             * visible, it is left completely alone so its own power-off
+             * timer (~120 s, reset by any connection) can finally run
+             * out — a docked/charging ring advertises indefinitely and
+             * must not be re-probed into staying awake.  The window
+             * reopens only when visibility breaks for OX_ABSENT_STRIKES
+             * scans (slept / worn / moved), or after a long safety
+             * timeout in case a recording ever happens while the ring
+             * remains visible.  (OxyII worn-state advertises as mfg
+             * 0x036F, which counts as absence here — same effect.) */
+            TickType_t served_for = xTaskGetTickCount() - s_served_at;
+            if (served_for < pdMS_TO_TICKS(OX_SERVED_REPROBE_MS)) {
+                ESP_LOGD(TAG, "watch: served %lus ago, ring visible — curfew, no reconnect",
+                         (unsigned long)(served_for / configTICK_RATE_HZ));
                 xSemaphoreGive(s_ops_mtx);
                 continue;
             }
-            ESP_LOGI(TAG, "watch: still advertising past END window — re-worn, resuming probes");
+            ESP_LOGI(TAG, "watch: ring visible %ld min since last sync — scheduled re-probe",
+                     (long)(served_for / pdMS_TO_TICKS(60000)));
             s_presence_served = false;
             s_f1_fail_count = 0;
+            s_legacy_fail_count = 0;
         }
 
         set_state(OX_STATUS_CONNECTING);
 
-        if (do_connect_and_discover(&s_scan[0].addr) != ESP_OK) {
+        /* ── Legacy ring: session owns connect → INFO → pull
+         * files → disconnect. Sync-ready = standby/off-finger, which is
+         * the only state in which it accepts sync connections; worn or
+         * recording rings simply fail to connect/answer and are retried
+         * later without being marked served. ── */
+        if (strcmp(s_protocol, OX_PROTO_LEGACY) == 0) {
+            char serial[32] = {0};
+            int pulled = 0;
+            legacy_sync_err_t r = legacy_sync_session(&s_scan[ti].addr,
+                                                      s_serial, true,
+                                                      serial, sizeof(serial),
+                                                      &pulled);
+            if (r == LEGACY_SYNC_OK) {
+                s_legacy_fail_count = 0;
+                s_presence_served = true;
+                s_served_at = xTaskGetTickCount();
+                s_last_sync_time = time(NULL);
+                s_last_pulled = pulled;
+                ESP_LOGI(TAG, "sync window served (%d file(s) pulled) — no reconnect; ring can power off",
+                         pulled);
+            } else if (++s_legacy_fail_count >= OX_LEGACY_MAX_FAILS) {
+                s_presence_served = true;
+                s_served_at = xTaskGetTickCount();
+                ESP_LOGW(TAG, "legacy ring unreachable after %d attempts (r=%d) — treating as served until next appearance",
+                         OX_LEGACY_MAX_FAILS, r);
+            } else {
+                ESP_LOGW(TAG, "legacy ring sync failed (r=%d), attempt %d/%d",
+                         r, s_legacy_fail_count, OX_LEGACY_MAX_FAILS);
+            }
+            set_state(OX_STATUS_PAIRED);
+            xSemaphoreGive(s_ops_mtx);
+            continue;
+        }
+
+        if (do_connect_and_discover(&s_scan[ti].addr) != ESP_OK) {
             ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);
@@ -1229,6 +1463,7 @@ static void pull_task(void *arg)
         ESP_LOGI(TAG, "file list: %d files", count);
 
         bool pull_ok = true;
+        int pulled = 0;
         for (int i = 0; i < count; i++) {
             if (names[i][0] == '\0') continue;
 
@@ -1244,12 +1479,15 @@ static void pull_task(void *arg)
                 pull_ok = false;
                 break;
             }
+            pulled++;
         }
 
         do_disconnect();
         if (pull_ok) {
             s_presence_served = true;
             s_served_at = xTaskGetTickCount();
+            s_last_sync_time = time(NULL);
+            s_last_pulled = pulled;
             ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
         } else {
             ESP_LOGW(TAG, "sync incomplete — will retry this presence");
@@ -1275,6 +1513,7 @@ esp_err_t oximeter_init(void)
 
     load_paired_from_nvs();
     ox_store_ensure_dirs();
+    legacy_init();                              /* legacy backend sync prims */
 
     if (s_paired)
         set_state(OX_STATUS_PAIRED);
@@ -1338,6 +1577,8 @@ cJSON *oximeter_get_scan_results(void)
         cJSON_AddStringToObject(e, "addr", addr_str);
         cJSON_AddStringToObject(e, "name", s_scan[i].name);
         cJSON_AddNumberToObject(e, "rssi", s_scan[i].rssi);
+        if (s_scan[i].proto)
+            cJSON_AddStringToObject(e, "proto", s_scan[i].proto);
         cJSON_AddItemToArray(arr, e);
     }
     return arr;
@@ -1368,6 +1609,7 @@ esp_err_t oximeter_forget(void)
     s_firmware[0] = '\0';
     s_name_prefix[0] = '\0';
     s_paired_addr[0] = '\0';
+    s_protocol = OX_PROTO_OXYII;
 
     nvs_writer_run(do_erase_nvs, NULL);
     ox_store_delete_paired();
@@ -1398,5 +1640,22 @@ cJSON *oximeter_get_paired_info(void)
     cJSON_AddStringToObject(info, "serial", s_serial);
     if (s_firmware[0]) cJSON_AddStringToObject(info, "firmware", s_firmware);
     if (s_paired_addr[0]) cJSON_AddStringToObject(info, "addr", s_paired_addr);
+    cJSON_AddStringToObject(info, "protocol", s_protocol);
+
+    /* Live ring data from the most recent session (legacy backend only). */
+    if (strcmp(s_protocol, OX_PROTO_LEGACY) == 0) {
+        char model[24];
+        int bat = -1, nfiles = -1;
+        long age = 0;
+        if (legacy_get_last_seen(model, sizeof(model), &bat, &nfiles, &age)) {
+            if (model[0]) cJSON_AddStringToObject(info, "model", model);
+            cJSON_AddNumberToObject(info, "battery", bat);
+            cJSON_AddNumberToObject(info, "files_on_ring", nfiles);
+        }
+    }
+    if (s_last_sync_time > 0) {
+        cJSON_AddNumberToObject(info, "last_sync", (double)s_last_sync_time);
+        cJSON_AddNumberToObject(info, "last_pulled", s_last_pulled);
+    }
     return info;
 }

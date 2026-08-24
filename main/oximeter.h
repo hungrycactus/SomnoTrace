@@ -40,6 +40,15 @@
 #define OX_STATUS_PAIRED     "paired"
 #define OX_STATUS_ERROR      "error"
 
+/* Protocol backend identifiers (persisted in NVS + paired.json).
+ * These are distinct Wellue protocols with incompatible framing:
+ *  - OXYII:  O2 Ring S / SleepHQ O2 Ring Pro, 0xA5 frames
+ *            (oximeter_oxyii.c)
+ *  - LEGACY: legacy Wellue rings (P02 / O2Ring), 0xAA frames
+ *            (oximeter_legacy.c) */
+#define OX_PROTO_OXYII  "oxyii"
+#define OX_PROTO_LEGACY "legacy"
+
 /* Initialise the oximeter module.  Must be called after as11_ble_init()
  * (shares the NimBLE host) and sd_storage_init().  Loads paired serial
  * from NVS and starts the background watch task. */
