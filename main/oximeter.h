@@ -62,6 +62,15 @@ typedef enum {
     OX_PROBE_PERSISTENT = 1,
 } ox_probe_mode_t;
 
+/* Protocol backend identifiers (persisted in NVS + paired.json).
+ * These are distinct Wellue protocols with incompatible framing:
+ *  - OXYII:  O2 Ring S / SleepHQ O2 Ring Pro, 0xA5 frames
+ *            (oximeter_oxyii.c)
+ *  - LEGACY: legacy Wellue rings (P02 / O2Ring), 0xAA frames
+ *            (oximeter_legacy.c) */
+#define OX_PROTO_OXYII  "oxyii"
+#define OX_PROTO_LEGACY "legacy"
+
 /* Initialise the oximeter module.  Must be called after as11_ble_init()
  * (shares the NimBLE host) and sd_storage_init().  Loads paired serial
  * from NVS and starts the background watch task. */
@@ -72,8 +81,17 @@ esp_err_t oximeter_init(void);
  * Results retrieved via oximeter_get_scan_results(). */
 esp_err_t oximeter_scan(int timeout_sec);
 
+<<<<<<< HEAD
 /* Return a cJSON array of discovered rings.
  * Each element: {"addr":"AA:BB:...","name":"...","rssi":-65,"type":"oxyii"|"legacy"}
+=======
+/* Cancel an in-progress oximeter_scan() early.  Results collected so far
+ * are kept; harmless if no scan is running. */
+void oximeter_scan_cancel(void);
+
+/* Return a cJSON array of discovered OxyII rings.
+ * Each element: {"addr":"AA:BB:...","name":"SHQO2Pro ...","rssi":-65}
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
  * Caller must cJSON_Delete(). */
 cJSON *oximeter_get_scan_results(void);
 
@@ -94,6 +112,23 @@ const char *oximeter_get_error(void);
 
 /* Return true if a ring serial is stored in NVS. */
 bool oximeter_is_paired(void);
+
+/* Coarse live presence of the paired ring, derived from the background
+ * watch scans and any in-flight session:
+ *   OX_PRESENCE_SYNCING  - BLE session running right now
+ *   OX_PRESENCE_READY    - visible and sync window open (transfer due)
+ *   OX_PRESENCE_DETECTED - visible, no transfer pending (post-sync curfew:
+ *                          on hand but deliberately left alone)
+ *   OX_PRESENCE_RECORDING- worn & recording: on-air via its recording-mode
+ *                          advert, but never connectable mid-recording
+ *   OX_PRESENCE_OFFLINE  - no adverts for several scans (asleep, worn,
+ *                          out of range, off) */
+#define OX_PRESENCE_SYNCING   "syncing"
+#define OX_PRESENCE_READY     "ready"
+#define OX_PRESENCE_DETECTED  "detected"
+#define OX_PRESENCE_RECORDING "recording"
+#define OX_PRESENCE_OFFLINE   "offline"
+const char *oximeter_get_presence(void);
 
 /* Return a cJSON object with paired ring info: serial, firmware,
  * name_prefix, last_addr, driver.  NULL if not paired.  Caller cJSON_Delete(). */

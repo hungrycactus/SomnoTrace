@@ -1,5 +1,5 @@
 /*
- * SomnoTrace - O2 Ring (OxyII) BLE protocol codec and session
+ * SomnoTrace - O2S / OxyII ring BLE protocol backend ("0xA5 protocol")
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  *
  * This file is part of SomnoTrace.
@@ -20,12 +20,17 @@
  * ADDITIONAL TERM (GPLv3 Section 7(b)): Redistributions must preserve the
  * attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
  * (https://github.com/ilyakruchinin)." See the NOTICE file for details.
- *
- * Clean-room OxyII BLE protocol for Wellue O2 Ring S / SleepHQ O2 Ring Pro.
- * See spec/0003-o2ring-ble-sync.md.
+ */
+
+/* Clean-room OxyII BLE protocol backend for Wellue O2 Ring S /
+ * SleepHQ O2 Ring Pro.  Implements the oximeter_backend_t interface;
+ * scanning, pairing persistence, sync scheduling and storage live in
+ * oximeter_common.c / oximeter_store.c.  Byte-level reference for both
+ * backends: ADD_LEGACY_OXIMETER.md.
  */
 
 #include "oximeter.h"
+<<<<<<< HEAD
 #include "oximeter_internal.h"
 #include "sd_storage.h"
 #include "as11_ble.h"
@@ -35,30 +40,30 @@
 #include "time_sync.h"
 #include "upload_sched.h"
 #include "log_stream.h"
+=======
+#include "oximeter_backend.h"
+#include "oximeter_store.h"
+#include "as11_ble.h"
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 #include <stdbool.h>
-#include <stdarg.h>
 #include <stdint.h>
 
 #include "esp_log.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
-#include "nvs_flash.h"
-#include "nvs.h"
-#include "cJSON.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
-#include "nimble/nimble_port.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 
+<<<<<<< HEAD
 static const char *TAG = "ox_oxyii";
 
 /* ── Store forward declarations (oximeter_store.c) ─────────────────── */
@@ -85,6 +90,11 @@ bool ox_store_promote(const char *serial, const char *name);
 void ox_store_part_remove(const char *name);
 
 /* ── OxyII protocol constants ──────────────────────────────────────── */
+=======
+static const char *TAG = "oxyii";
+
+/* ── Protocol constants ────────────────────────────────────────────── */
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 #define OXYII_LEAD         0xA5
 #define OXYII_HEADER_LEN   7
 #define OXYII_MAX_FRAME    2048
@@ -101,8 +111,9 @@ void ox_store_part_remove(const char *name);
 #define OP_READ_FILE_END   0xF4
 #define OP_AUTH            0xFF
 
+/* Manufacturer ids seen in adverts. */
 #define MFG_OXYII          0xF34E
-#define MFG_RECORDING      0x036F
+#define MFG_RECORDING      0x036F   /* worn / recording — never a candidate */
 
 /* MD5("lepucloud") = c2a7cf50dafed885a8f8f7eac44335f3 */
 static const uint8_t LEPUCLOUD_MD5[16] = {
@@ -121,7 +132,7 @@ static const ble_uuid128_t OXYII_NOTIFY_UUID =
     BLE_UUID128_INIT(0x48, 0x12, 0xd0, 0x41, 0x29, 0x4e, 0x1b, 0x83,
                      0xf9, 0x98, 0x4b, 0xa1, 0x03, 0x00, 0xfb, 0xe8);
 
-/* ── CRC8 (poly=0x07, init=0) ──────────────────────────────────────── */
+/* ── CRC8 (poly=0x07, init=0) over all bytes except trailing CRC ───── */
 static uint8_t oxyii_crc8(const uint8_t *data, int len)
 {
     uint8_t crc = 0;
@@ -251,7 +262,7 @@ static void oxyii_file_start_payload(uint8_t *out20, const char *name)
     /* bytes 16..19: file type = 0 */
 }
 
-/* ── READ_FILE_DATA payload (4 bytes) ──────────────────────────────── */
+/* ── READ_FILE_DATA payload (4 bytes absolute offset) ──────────────── */
 static void oxyii_file_data_payload(uint8_t *out4, uint32_t offset)
 {
     out4[0] = offset & 0xFF;
@@ -260,6 +271,7 @@ static void oxyii_file_data_payload(uint8_t *out4, uint32_t offset)
     out4[3] = (offset >> 24) & 0xFF;
 }
 
+<<<<<<< HEAD
 /* ── Module state ──────────────────────────────────────────────────── */
 #define OX_SCAN_MAX 16
 
@@ -278,14 +290,17 @@ struct pair_arg {
 
 static SemaphoreHandle_t s_state_mtx;
 static SemaphoreHandle_t s_ops_mtx;     /* serialise BLE ops (scan/pair/pull) */
+=======
+/* ── Backend state (single connection at a time, ops mutex serialises) */
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 static SemaphoreHandle_t s_op_sem;      /* GATT op completion */
 static SemaphoreHandle_t s_conn_sem;    /* connect completion */
 static SemaphoreHandle_t s_resp_sem;    /* notification response */
-static SemaphoreHandle_t s_scan_done;
 static volatile int s_op_status;
 static volatile int s_conn_status;
 static bool s_initialized;
 
+<<<<<<< HEAD
 static char s_status[24] = OX_STATUS_IDLE;
 static char s_error[128];
 
@@ -316,6 +331,8 @@ static ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
  * See .ai/OXIMETRY2.md for the experiment that established this value. */
 #define OX_PERSISTENT_POLL_MS 30000
 
+=======
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 /* BLE connection state */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_write_handle;
@@ -324,18 +341,28 @@ static uint16_t s_cccd_handle;
 static uint16_t s_svc_start, s_svc_end;
 static uint8_t s_seq = 0;
 
+<<<<<<< HEAD
 /* Scan state */
 static struct ox_scan_result *s_scan;
 static int s_scan_count;
 
 /* Notification accumulation buffer — PSRAM-allocated at init */
 static uint8_t *s_resp_buf;
+=======
+/* Notification accumulation buffer */
+static uint8_t s_resp_buf[OXYII_MAX_FRAME];
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 static int s_resp_len;
 static uint8_t s_resp_opcode;
 static uint8_t *s_resp_payload;
 static int s_resp_payload_len;
 
+/* Serial of the currently paired device — needed by pull_file() to pick
+ * the storage directory.  Set by sync()/identify() via common layer. */
+static char s_dev_serial[32];
+
 /* ── Helpers ───────────────────────────────────────────────────────── */
+<<<<<<< HEAD
 static void set_state(const char *st)
 {
     xSemaphoreTake(s_state_mtx, portMAX_DELAY);
@@ -355,6 +382,8 @@ static void set_error(const char *fmt, ...)
     va_end(ap);
 }
 
+=======
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 static void clear_op_sem(void)
 {
     while (xSemaphoreTake(s_op_sem, 0) == pdTRUE) { }
@@ -367,6 +396,7 @@ static int wait_op(int timeout_ms)
     return s_op_status;
 }
 
+<<<<<<< HEAD
 static void addr_to_str(const ble_addr_t *a, char *out, size_t outsz)
 {
     snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -429,11 +459,28 @@ static void handle_notify_rx(const uint8_t *data, int len)
     }
     /* rc == -1: incomplete, wait for more data */
 }
+=======
+static bool name_is_oxyii(const char *name)
+{
+    if (!name || !name[0]) return false;
+    char up[32];
+    int i;
+    for (i = 0; i < 31 && name[i]; i++)
+        up[i] = toupper((unsigned char)name[i]);
+    up[i] = '\0';
+    return strncmp(up, "S8-AW", 5) == 0 ||
+           strncmp(up, "SHQO2PRO", 8) == 0;
+}
+
+/* ── Connection GAP event handler (this backend's connections only) ── */
+static void handle_notify_rx(const uint8_t *data, int len);
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
     switch (event->type) {
+<<<<<<< HEAD
     case BLE_GAP_EVENT_DISC: {
         char addr_str[18];
         addr_to_str(&event->disc.addr, addr_str, sizeof(addr_str));
@@ -517,6 +564,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         xSemaphoreGive(s_scan_done);
         return 0;
 
+=======
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
     case BLE_GAP_EVENT_CONNECT:
         s_conn_handle = event->connect.conn_handle;
         s_conn_status = event->connect.status;
@@ -545,11 +594,38 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         return 0;
     }
     case BLE_GAP_EVENT_MTU:
-        ESP_LOGI(TAG, "MTU: %d", event->mtu.value);
+        ESP_LOGI(TAG, "MTU negotiated: %d", event->mtu.value);
         return 0;
     default:
         return 0;
     }
+}
+
+/* Handle notification: accumulate and try to decode. */
+static void handle_notify_rx(const uint8_t *data, int len)
+{
+    if (s_resp_len + len > (int)sizeof(s_resp_buf)) {
+        ESP_LOGW(TAG, "notify overflow: resp_len=%d + %d > %d",
+                 s_resp_len, len, (int)sizeof(s_resp_buf));
+        s_resp_len = 0;
+    }
+    memcpy(s_resp_buf + s_resp_len, data, len);
+    s_resp_len += len;
+
+    uint8_t op, flag, seq;
+    int plen;
+    int rc = oxyii_try_decode(s_resp_buf, s_resp_len, &op, &flag, &seq,
+                               s_resp_payload, &plen, sizeof(s_resp_payload));
+    if (rc > 0) {
+        s_resp_opcode = op;
+        s_resp_payload_len = plen;
+        s_resp_len = 0;
+        xSemaphoreGive(s_resp_sem);
+    } else if (rc == -2) {
+        ESP_LOGW(TAG, "notify decode error, resetting buffer");
+        s_resp_len = 0;
+    }
+    /* rc == -1: incomplete, wait for more data */
 }
 
 /* ── GATT discovery callbacks ──────────────────────────────────────── */
@@ -621,9 +697,13 @@ static int on_write_done(uint16_t conn, const struct ble_gatt_error *err,
 }
 
 /* ── Connect and discover GATT services ────────────────────────────── */
+<<<<<<< HEAD
 /* do_mtu=false skips MTU exchange (persistent-mode contact polling uses
  * only tiny LIVE_B frames that fit in the default 23-byte ATT MTU). */
 static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
+=======
+static esp_err_t connect_and_discover(const ble_addr_t *target)
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 {
     s_write_handle = s_notify_handle = s_cccd_handle = 0;
     s_svc_start = s_svc_end = 0;
@@ -643,18 +723,18 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
     uint8_t own_addr_type;
     int rc = ble_hs_id_infer_auto(target->type, &own_addr_type);
     if (rc != 0) {
-        set_error("addr infer failed: %d", rc);
+        ESP_LOGE(TAG, "addr infer failed: %d", rc);
         return ESP_FAIL;
     }
     clear_op_sem();
     rc = ble_gap_connect(own_addr_type, target,
                          15000, NULL, gap_event, NULL);
-    if (rc != 0) { set_error("connect start failed: %d", rc); return ESP_FAIL; }
+    if (rc != 0) { ESP_LOGE(TAG, "connect start failed: %d", rc); return ESP_FAIL; }
     if (xSemaphoreTake(s_conn_sem, pdMS_TO_TICKS(16000)) != pdTRUE) {
-        set_error("connect timeout"); return ESP_FAIL;
+        ESP_LOGE(TAG, "connect timeout"); return ESP_FAIL;
     }
     if (s_conn_status != 0) {
-        set_error("connect failed: %d", s_conn_status); return ESP_FAIL;
+        ESP_LOGE(TAG, "connect failed: %d", s_conn_status); return ESP_FAIL;
     }
     ESP_LOGI(TAG, "connected, handle=%d", s_conn_handle);
 
@@ -670,9 +750,9 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
     rc = ble_gattc_disc_svc_by_uuid(s_conn_handle, &OXYII_SVC_UUID.u,
                                      on_disc_svc, NULL);
     if (rc != 0 || wait_op(10000) != 0) {
-        set_error("OxyII service not found"); return ESP_FAIL;
+        ESP_LOGE(TAG, "OxyII service not found"); return ESP_FAIL;
     }
-    if (s_svc_start == 0) { set_error("service range empty"); return ESP_FAIL; }
+    if (s_svc_start == 0) { ESP_LOGE(TAG, "service range empty"); return ESP_FAIL; }
     ESP_LOGI(TAG, "service: 0x%04x-0x%04x", s_svc_start, s_svc_end);
 
     /* Discover characteristics */
@@ -680,10 +760,10 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
     rc = ble_gattc_disc_all_chrs(s_conn_handle, s_svc_start, s_svc_end,
                                  on_disc_chr, NULL);
     if (rc != 0 || wait_op(10000) != 0) {
-        set_error("characteristic discovery failed"); return ESP_FAIL;
+        ESP_LOGE(TAG, "characteristic discovery failed"); return ESP_FAIL;
     }
     if (s_write_handle == 0 || s_notify_handle == 0) {
-        set_error("write/notify char not found"); return ESP_FAIL;
+        ESP_LOGE(TAG, "write/notify char not found"); return ESP_FAIL;
     }
     ESP_LOGI(TAG, "write=%d notify=%d", s_write_handle, s_notify_handle);
 
@@ -692,9 +772,9 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
     rc = ble_gattc_disc_all_dscs(s_conn_handle, s_notify_handle, s_svc_end,
                                  on_disc_dsc, NULL);
     if (rc != 0 || wait_op(10000) != 0) {
-        set_error("CCCD discovery failed"); return ESP_FAIL;
+        ESP_LOGE(TAG, "CCCD discovery failed"); return ESP_FAIL;
     }
-    if (s_cccd_handle == 0) { set_error("CCCD not found"); return ESP_FAIL; }
+    if (s_cccd_handle == 0) { ESP_LOGE(TAG, "CCCD not found"); return ESP_FAIL; }
 
     /* Enable notifications */
     uint8_t cccd_val[2] = { 0x01, 0x00 };
@@ -702,7 +782,7 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
     rc = ble_gattc_write_flat(s_conn_handle, s_cccd_handle,
                               cccd_val, 2, on_write_done, NULL);
     if (rc != 0 || wait_op(5000) != 0) {
-        set_error("enable notify failed"); return ESP_FAIL;
+        ESP_LOGE(TAG, "enable notify failed"); return ESP_FAIL;
     }
     ESP_LOGI(TAG, "notifications enabled (cccd=%d)", s_cccd_handle);
     return ESP_OK;
@@ -982,6 +1062,7 @@ static esp_err_t oxyii_pull_file(const char *name)
     if (oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000) != ESP_OK)
         ESP_LOGW(TAG, "F4 ack missing after '%s'", name);
 
+<<<<<<< HEAD
     /* Completion requires both an exact transfer and the O2 Ring S trailer. */
     if (!transfer_complete || file_size == 0) {
         ESP_LOGW(TAG, "incomplete '%s': %lu/%lu bytes; retaining .part",
@@ -989,6 +1070,10 @@ static esp_err_t oxyii_pull_file(const char *name)
         return ESP_FAIL;
     }
     bool finalised = ox_store_promote(s_serial, name);
+=======
+    /* Promote .part to .bin */
+    bool finalised = ox_store_promote(s_dev_serial, name);
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
     ESP_LOGI(TAG, "pulled '%s': %lu bytes, finalised=%d",
              name, (unsigned long)offset, finalised);
     if (!finalised) return ESP_FAIL;
@@ -996,9 +1081,9 @@ static esp_err_t oxyii_pull_file(const char *name)
     return oxyii_convert_stored(name);
 }
 
-/* ── NVS persistence ───────────────────────────────────────────────── */
-#define OX_NVS_NS "oximeter"
+/* ══ Backend interface implementation ════════════════════════════════ */
 
+<<<<<<< HEAD
 struct ox_nvs_arg {
     char serial[32];
     char firmware[16];
@@ -1023,10 +1108,23 @@ static esp_err_t do_save_nvs(void *arg)
     e = nvs_commit(h);
     nvs_close(h);
     return e;
+=======
+static void oxyii_init(void)
+{
+    if (s_op_sem) return;
+    s_op_sem   = xSemaphoreCreateBinary();
+    s_conn_sem = xSemaphoreCreateBinary();
+    s_resp_sem = xSemaphoreCreateBinary();
+    if (!s_op_sem || !s_conn_sem || !s_resp_sem)
+        ESP_LOGE(TAG, "semaphore creation failed");
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 }
 
-static esp_err_t do_erase_nvs(void *arg)
+/* Advert scoring — see oximeter_backend.h for tier semantics. */
+static int oxyii_adv_score(const char *name, uint16_t mfg_cid,
+                           const uint8_t *raw_adv, int raw_len)
 {
+<<<<<<< HEAD
     (void)arg;
     nvs_handle_t h;
     esp_err_t e = nvs_open(OX_NVS_NS, NVS_READWRITE, &h);
@@ -1053,10 +1151,28 @@ static esp_err_t do_save_probe_mode(void *arg)
     e = nvs_commit(h);
     nvs_close(h);
     return e;
+=======
+    (void)raw_adv; (void)raw_len;
+    /* Worn/recording adverts are visible-only: never connect (a GATT
+     * link would reset the ring's power-off timer mid-recording), but
+     * report them so presence can show "worn · recording" instead of
+     * pretending the ring vanished.  They still count as absence for
+     * the connect-curfew model — that is what detects end-of-recording. */
+    if (mfg_cid == MFG_RECORDING)
+        return -1;
+    if (name_is_oxyii(name))
+        return 3;                       /* explicit device-name match */
+    if (mfg_cid == MFG_OXYII)
+        return 2;                       /* shared Viatom id heuristic */
+    return 0;
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 }
 
-static void load_paired_from_nvs(void)
+static bool oxyii_identify(const ble_addr_t *addr,
+                           char *serial, size_t serial_sz,
+                           char *firmware, size_t fw_sz)
 {
+<<<<<<< HEAD
     nvs_handle_t h;
     nvs_writer_lock();
     if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) != ESP_OK) { nvs_writer_unlock(); return; }
@@ -1130,11 +1246,22 @@ static void pair_task(void *arg)
         xSemaphoreGive(s_ops_mtx);
         vTaskDelete(NULL);
         return;
-    }
+=======
+    if (serial_sz) serial[0] = '\0';
+    if (fw_sz) firmware[0] = '\0';
 
-    if (oxyii_session_open() != ESP_OK) {
-        set_error("session open failed");
+    strlcpy(s_dev_serial, "", sizeof(s_dev_serial));
+
+    if (connect_and_discover(addr) != ESP_OK) {
         do_disconnect();
+        return false;
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
+    }
+    if (oxyii_session_open() != ESP_OK ||
+        oxyii_get_info(serial, serial_sz, firmware, fw_sz) != ESP_OK ||
+        serial[0] == '\0') {
+        do_disconnect();
+<<<<<<< HEAD
         free(pa);
         xSemaphoreGive(s_ops_mtx);
         vTaskDelete(NULL);
@@ -1212,34 +1339,30 @@ static void pair_task(void *arg)
     free(pa);
     xSemaphoreGive(s_ops_mtx);
     vTaskDelete(NULL);
+=======
+        return false;
+    }
+    strlcpy(s_dev_serial, serial, sizeof(s_dev_serial));
+    do_disconnect();
+    return true;
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 }
 
-/* ── Low-duty OxyII scan (caller holds s_ops_mtx) ──────────────────── */
-static esp_err_t do_scan(int timeout_sec)
+static ox_sync_err_t oxyii_sync(const ble_addr_t *addr,
+                                const char *expect_serial,
+                                bool download,
+                                char *serial, size_t serial_sz,
+                                int *files_pulled)
 {
-    s_scan_count = 0;
+    if (files_pulled) *files_pulled = 0;
+    if (serial_sz) serial[0] = '\0';
 
-    struct ble_gap_disc_params dp = {
-        .itvl = 160,   /* 100 ms */
-        .window = 48,  /* 30 ms  — low duty; pairing scan uses 96/96 */
-        .filter_policy = 0,
-        .limited = 0,
-        .passive = 1,  /* watch is listen-only; no scan requests */
-    };
-
-    uint8_t own_addr_type;
-    int rc = ble_hs_id_infer_auto(BLE_ADDR_RANDOM, &own_addr_type);
-    if (rc != 0) own_addr_type = as11_ble_get_own_addr_type();
-
-    while (xSemaphoreTake(s_scan_done, 0) == pdTRUE) { }
-
-    rc = ble_gap_disc(own_addr_type,
-                      timeout_sec * 1000, &dp, gap_event, NULL);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "scan start failed: %d", rc);
-        return ESP_FAIL;
+    if (connect_and_discover(addr) != ESP_OK) {
+        do_disconnect();
+        return OX_SYNC_ERR_CONNECT;
     }
 
+<<<<<<< HEAD
     xSemaphoreTake(s_scan_done, pdMS_TO_TICKS((timeout_sec + 2) * 1000));
     return ESP_OK;
 }
@@ -1340,10 +1463,33 @@ static void pull_task(void *arg)
         ESP_LOGW(TAG, "watch: host not ready, aborting");
         vTaskDelete(NULL);
         return;
+=======
+    /* Probe only: AUTH+SETUP. Never F4 while we may still be recording. */
+    if (oxyii_session_open() != ESP_OK) {
+        ESP_LOGW(TAG, "session open failed");
+        do_disconnect();
+        return OX_SYNC_ERR_CONNECT;
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
     }
 
-    ox_store_ensure_dirs();
+    char fw[16] = {0};
+    char dev[32] = {0};
+    if (oxyii_get_info(dev, sizeof(dev), fw, sizeof(fw)) != ESP_OK ||
+        dev[0] == '\0') {
+        ESP_LOGW(TAG, "get_info failed");
+        do_disconnect();
+        return OX_SYNC_ERR_INFO;
+    }
+    if (expect_serial && strcmp(dev, expect_serial) != 0) {
+        ESP_LOGW(TAG, "serial mismatch (got '%s', want '%s')",
+                 dev, expect_serial);
+        do_disconnect();
+        return OX_SYNC_ERR_IDENTITY;
+    }
+    if (serial_sz) strlcpy(serial, dev, serial_sz);
+    strlcpy(s_dev_serial, dev, sizeof(s_dev_serial));
 
+<<<<<<< HEAD
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(15000));
 
@@ -1573,25 +1719,28 @@ static void pull_task(void *arg)
          * (LIVE_B [5] == 0x00). On-finger / unknown / F1-wedge: drop
          * the link immediately so the ring can keep recording or
          * finish countdown and sleep. Do not mark served. */
+=======
+    /* Pull only in the documented no-contact END window
+     * (LIVE_B [5] == 0x00). On-finger / unknown / F1-wedge: drop the
+     * link immediately so the ring can keep recording or finish
+     * countdown and sleep. NOT_READY ⇒ common layer backs off without
+     * counting a failure. */
+    if (download) {
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
         int off = oxyii_off_finger();
         if (off != 1) {
-            ESP_LOGI(TAG, "watch: not off-finger (live_b=%d) — disconnect, retry in %ds",
-                     off, OX_WORN_PROBE_MS / 1000);
+            ESP_LOGI(TAG, "not off-finger (live_b=%d)", off);
             do_disconnect();
-            set_state(OX_STATUS_PAIRED);
-            xSemaphoreGive(s_ops_mtx);
-            vTaskDelay(pdMS_TO_TICKS(OX_WORN_PROBE_MS));
-            continue;
+            return OX_SYNC_NOT_READY;
         }
 
         if (oxyii_prepare_files() != ESP_OK) {
-            ESP_LOGW(TAG, "watch: file prep failed");
+            ESP_LOGW(TAG, "file prep failed");
             do_disconnect();
-            set_state(OX_STATUS_PAIRED);
-            xSemaphoreGive(s_ops_mtx);
-            continue;
+            return OX_SYNC_ERR_TRANSFER;
         }
 
+<<<<<<< HEAD
         bool pull_ok = do_pull_and_mark(NULL);
         do_disconnect();
         if (pull_ok) {
@@ -1690,19 +1839,41 @@ static esp_err_t oxyii_scan(int timeout_sec)
         set_error("scan start failed: %d", rc);
         xSemaphoreGive(s_ops_mtx);
         return ESP_FAIL;
+=======
+        char names[32][17];
+        int count = oxyii_get_file_list(names, 32);
+        if (count < 0) {
+            ESP_LOGW(TAG, "file list failed");
+            do_disconnect();
+            return OX_SYNC_ERR_TRANSFER;
+        }
+        ESP_LOGI(TAG, "file list: %d files", count);
+
+        for (int i = 0; i < count; i++) {
+            if (names[i][0] == '\0') continue;
+
+            int idx = ox_store_index_check(s_dev_serial, names[i]);
+            if (idx == 1) {
+                ESP_LOGD(TAG, "skip '%s' (already finalised)", names[i]);
+                continue;
+            }
+
+            ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
+            if (oxyii_pull_file(names[i]) != ESP_OK) {
+                ESP_LOGW(TAG, "pull failed for '%s'", names[i]);
+                do_disconnect();
+                return OX_SYNC_ERR_TRANSFER;
+            }
+            if (files_pulled) (*files_pulled)++;
+        }
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
     }
 
-    xSemaphoreTake(s_scan_done, pdMS_TO_TICKS((timeout_sec + 2) * 1000));
-
-    if (s_paired)
-        set_state(OX_STATUS_PAIRED);
-    else
-        set_state(OX_STATUS_IDLE);
-
-    xSemaphoreGive(s_ops_mtx);
-    return ESP_OK;
+    do_disconnect();
+    return OX_SYNC_OK;
 }
 
+<<<<<<< HEAD
 static cJSON *oxyii_get_scan_results(void)
 {
     cJSON *arr = cJSON_CreateArray();
@@ -1823,4 +1994,14 @@ const ox_driver_ops_t oxyii_driver_ops = {
     .get_paired_info  = oxyii_get_paired_info,
     .get_probe_mode   = oxyii_get_probe_mode,
     .set_probe_mode   = oxyii_set_probe_mode,
+=======
+const oximeter_backend_t oximeter_backend_oxyii = {
+    .proto_id              = OX_PROTO_OXYII,
+    .init                  = oxyii_init,
+    .adv_score             = oxyii_adv_score,
+    .identify              = oxyii_identify,
+    .sync                  = oxyii_sync,
+    .report_status         = NULL,      /* nothing beyond base fields today */
+    .max_consecutive_fails = 3,         /* mirrors the historical F1 retry cap */
+>>>>>>> 1faf953 (Add support for legacy Wellue O2 oximeter ring; refactored oximeter backend)
 };
