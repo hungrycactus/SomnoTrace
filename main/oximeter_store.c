@@ -1,5 +1,14 @@
 /*
- * SomnoTrace - O2 Ring oximetry storage (SD card, raw Format A files)
+ * SomnoTrace - Oximetry recording storage (SD card)
+ *
+ * Shared by both protocol backends.  Recordings land in
+ * oximetry/inbox/<name>.part as they stream in, then are promoted:
+ *   - OxyII (Format A)  → files/<serial>/<name>.bin, accepted only if
+ *     the Format-A trailer magic is present at size - 44.
+ *   - Legacy (.vld)     → files/<serial>/<name> verbatim, accepted only
+ *     if the byte count equals the size declared by FILE_OPEN.
+ * index.json records every promotion for duplicate suppression; see
+ * ADD_LEGACY_OXIMETER.md for the full layout.
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  *
  * This file is part of SomnoTrace.
@@ -61,7 +70,8 @@ void ox_store_ensure_dirs(void)
 bool ox_store_load_paired(char *serial, size_t serial_sz,
                           char *firmware, size_t fw_sz,
                           char *name_prefix, size_t prefix_sz,
-                          char *last_addr, size_t addr_sz)
+                          char *last_addr, size_t addr_sz,
+                          char *protocol, size_t protocol_sz)
 {
     FILE *f = fopen(OXY_PAIRED_JSON, "r");
     if (!f) return false;
@@ -96,13 +106,17 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
     cJSON *la = cJSON_GetObjectItem(j, "last_addr");
     if (la && cJSON_IsString(la) && last_addr)
         strlcpy(last_addr, la->valuestring, addr_sz);
+    cJSON *pr = cJSON_GetObjectItem(j, "protocol");
+    if (pr && cJSON_IsString(pr) && protocol && protocol_sz > 0)
+        strlcpy(protocol, pr->valuestring, protocol_sz);
 
     cJSON_Delete(j);
     return ok;
 }
 
 void ox_store_save_paired(const char *serial, const char *firmware,
-                          const char *name_prefix, const char *last_addr)
+                          const char *name_prefix, const char *last_addr,
+                          const char *protocol)
 {
     ox_store_ensure_dirs();
     cJSON *j = cJSON_CreateObject();
@@ -110,6 +124,7 @@ void ox_store_save_paired(const char *serial, const char *firmware,
     if (firmware) cJSON_AddStringToObject(j, "firmware", firmware);
     if (name_prefix) cJSON_AddStringToObject(j, "name_prefix", name_prefix);
     if (last_addr) cJSON_AddStringToObject(j, "last_addr", last_addr);
+    if (protocol) cJSON_AddStringToObject(j, "protocol", protocol);
     char *json = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
     if (!json) return;
@@ -263,9 +278,16 @@ esp_err_t ox_store_part_append(const char *name, const uint8_t *data, size_t len
     return ESP_OK;
 }
 
-/* Promote a .part file to files/<serial>/<name>.bin if trailer magic
- * is present.  Returns true if promoted (finalised), false otherwise. */
-bool ox_store_promote(const char *serial, const char *name)
+/* Shared promotion path: validate inbox/<name>.part, copy it verbatim to
+ * files/<serial>/<dst_name>, remove the .part and index the recording.
+ * Validation mode:
+ *   trailer_rule  - OxyII Format-A: magic at file_size - 44 must be
+ *                   present; `finalised` reflects the check result.
+ *   !trailer_rule - native-format recordings: exact byte size match
+ *                   required, otherwise nothing is stored or indexed. */
+static bool ox_store_promote_impl(const char *serial, const char *name,
+                                  bool append_bin, bool trailer_rule,
+                                  long expected_size)
 {
     char part_path[128];
     snprintf(part_path, sizeof(part_path), "%s/%s.part", OXY_INBOX, name);
@@ -276,12 +298,29 @@ bool ox_store_promote(const char *serial, const char *name)
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (fsize < TRAILER_LEN) {
-        fclose(f);
-        return false;
+
+    bool finalised;
+    if (trailer_rule) {
+        if (fsize < TRAILER_LEN) {
+            fclose(f);
+            return false;
+        }
+        uint8_t magic[4];
+        finalised = fseek(f, fsize - 44, SEEK_SET) == 0 &&
+                    fread(magic, 1, 4, f) == 4 &&
+                    memcmp(magic, TRAILER_MAGIC, 4) == 0;
+    } else {
+        if (expected_size <= 0 || fsize != expected_size) {
+            ESP_LOGE(TAG, "promote '%s': size mismatch (have %ld, want %ld) — not stored",
+                     name, fsize, expected_size);
+            fclose(f);
+            return false;
+        }
+        finalised = true;
     }
 
     /* Read the whole file into memory (files are typically < 300 KB). */
+    fseek(f, 0, SEEK_SET);
     uint8_t *data = malloc(fsize);
     if (!data) {
         fclose(f);
@@ -295,22 +334,21 @@ bool ox_store_promote(const char *serial, const char *name)
         return false;
     }
 
-    /* Check trailer magic at file_size - 44. */
-    bool finalised = false;
-    if (fsize >= TRAILER_LEN &&
-        memcmp(data + fsize - 44, TRAILER_MAGIC, 4) == 0) {
-        finalised = true;
-    }
-
     /* Create files/<serial>/ directory. */
     char serial_dir[160];
     snprintf(serial_dir, sizeof(serial_dir), "%s/%s", OXY_FILES, serial);
     mkdir(OXY_FILES, 0775);
     mkdir(serial_dir, 0775);
 
-    /* Write the final .bin file. */
+    /* Write the final file — native filename preserved when the caller
+     * does not request the legacy .bin suffix. */
     char bin_path[256];
-    snprintf(bin_path, sizeof(bin_path), "%s/%s/%s.bin", OXY_FILES, serial, name);
+    if (append_bin)
+        snprintf(bin_path, sizeof(bin_path), "%s/%s/%s.bin",
+                 OXY_FILES, serial, name);
+    else
+        snprintf(bin_path, sizeof(bin_path), "%s/%s/%s",
+                 OXY_FILES, serial, name);
     f = fopen(bin_path, "wb");
     if (!f) {
         ESP_LOGE(TAG, "cannot create %s", bin_path);
@@ -329,6 +367,21 @@ bool ox_store_promote(const char *serial, const char *name)
 
     ESP_LOGI(TAG, "promoted %s (%ld bytes, finalised=%d)", bin_path, fsize, finalised);
     return finalised;
+}
+
+/* Promote a .part file to files/<serial>/<name>.bin if trailer magic
+ * is present.  Returns true if promoted (finalised), false otherwise. */
+bool ox_store_promote(const char *serial, const char *name)
+{
+    return ox_store_promote_impl(serial, name, true, true, 0);
+}
+
+/* Promote inbox/<name>.part verbatim after an exact byte-size check.
+ * Used for native-format recordings (legacy-ring .vld files). */
+bool ox_store_promote_exact(const char *serial, const char *name,
+                            long expected_size)
+{
+    return ox_store_promote_impl(serial, name, false, false, expected_size);
 }
 
 /* Remove a .part file (e.g. after failed promotion or to restart). */
