@@ -424,7 +424,10 @@ esp_err_t netprov_init(void)
 /* ------------------------------------------------------------------ */
 /*  STA connect with scan + candidate selection                       */
 /* ------------------------------------------------------------------ */
+/* rec != NULL pins the association to the exact BSS found by the candidate
+ * scan (BSSID + channel).  NULL falls back to supplicant FAST_SCAN by SSID. */
 static esp_err_t try_single_ssid(const char *ssid, const char *pass,
+                                 const wifi_ap_record_t *rec,
                                  char *ip_out, int timeout_ms)
 {
     if (s_portal_mode) return ESP_FAIL;
@@ -435,7 +438,22 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
     wifi_config_t wc = { 0 };
     strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
     strlcpy((char *)wc.sta.password, pass, sizeof(wc.sta.password));
-    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    /* Non-empty password implies at least WPA2 — being explicit is
+     * deterministic and silences the supplicant's auto-raise warning. */
+    wc.sta.threshold.authmode =
+        (pass[0] != '\0') ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    /* PMF capable (not required): keeps WPA2 working, enables WPA2/WPA3
+     * mixed-mode APs. */
+    wc.sta.pmf_cfg.capable = true;
+    if (rec) {
+        memcpy(wc.sta.bssid, rec->bssid, sizeof(wc.sta.bssid));
+        wc.sta.bssid_set = true;
+        wc.sta.channel   = rec->primary;   /* skip the channel sweep */
+        ESP_LOGI(TAG, "pinning '%s' bssid=%02x:%02x:%02x:%02x:%02x:%02x ch=%d rssi=%d",
+                 ssid, rec->bssid[0], rec->bssid[1], rec->bssid[2],
+                 rec->bssid[3], rec->bssid[4], rec->bssid[5],
+                 rec->primary, rec->rssi);
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
@@ -509,14 +527,20 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
 
         ap_count = 0;
         esp_wifi_scan_get_ap_num(&ap_count);
-        if (ap_count > 32) ap_count = 32;
+        /* 60: dense multi-AP deployments (same SSID on many BSSes, mesh
+         * systems, neighbours) can exceed the old cap of 32, hiding the
+         * strongest same-SSID record from candidate selection. */
+        if (ap_count > 60) ap_count = 60;
 
         records = calloc(ap_count, sizeof(wifi_ap_record_t));
         if (records && ap_count) {
             esp_wifi_scan_get_ap_records(&ap_count, records);
         }
 
-        /* Build candidates: strongest matching SSID first */
+        /* Build candidates in slot priority order (Network #1 first). Slots
+         * whose SSID is not visible are skipped; within a slot, the strongest
+         * same-SSID AP is used. No cross-slot RSSI ranking — a farther
+         * Network #1 still wins over a closer Network #2. */
         n_cands = 0;
         for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
             if (cfg->wifi[i].ssid[0] == '\0') continue;
@@ -560,18 +584,10 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
         return ESP_FAIL;
     }
 
-    /* Sort by RSSI descending (bubble, small N) */
-    for (int i = 0; i < n_cands - 1; i++) {
-        for (int j = i + 1; j < n_cands; j++) {
-            if (cands[j].rssi > cands[i].rssi) {
-                cand_t t = cands[i]; cands[i] = cands[j]; cands[j] = t;
-            }
-        }
-    }
-
     if (s_portal_mode) return ESP_FAIL;
 
-    /* 3. Try each candidate: 3 attempts, 5 s between retries */
+    /* Try each visible candidate in slot priority order: 3 attempts, 5 s
+     * between retries. */
     for (int i = 0; i < n_cands; i++) {
         if (s_portal_mode) return ESP_FAIL;
         int slot = cands[i].slot;
@@ -579,9 +595,13 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
                  i + 1, cfg->wifi[slot].ssid, cands[i].rssi);
 
         for (int attempt = 1; attempt <= MAX_STA_RETRY; attempt++) {
+            /* Pin the scanned BSS on the first attempt only: if that exact
+             * AP has since gone away, later attempts fall back to un-pinned
+             * FAST_SCAN so a sibling AP with the same SSID can take over. */
             esp_err_t err = try_single_ssid(cfg->wifi[slot].ssid,
-                                            cfg->wifi[slot].pass, ip_out,
-                                            timeout_ms);
+                                            cfg->wifi[slot].pass,
+                                            attempt == 1 ? &cands[i].rec : NULL,
+                                            ip_out, timeout_ms);
             if (err == ESP_OK) return ESP_OK;
             if (attempt < MAX_STA_RETRY) {
                 ESP_LOGI(TAG, "waiting 5 s before retry %d/%d",

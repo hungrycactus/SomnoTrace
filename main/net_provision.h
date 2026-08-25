@@ -78,8 +78,10 @@ bool netprov_load_config(struct netprov_config *cfg);
 esp_err_t netprov_save_config(const struct netprov_config *cfg);
 
 /* Try to connect as a station using stored credentials.
- * Scans, picks the strongest matching SSID, tries up to 3 attempts
- * with 5 s spacing per candidate. On success writes IP into ip_out
+ * Scans, then tries configured networks strictly in slot priority order
+ * (Network #1 first; a slot is skipped if its SSID is not visible).
+ * Within a slot the strongest same-SSID AP is used; each candidate gets up
+ * to 3 attempts with 5 s spacing. On success writes IP into ip_out
  * (>= 16 bytes) and returns ESP_OK. */
 esp_err_t netprov_try_connect(const struct netprov_config *cfg,
                               char *ip_out, int timeout_ms);
