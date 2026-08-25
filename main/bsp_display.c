@@ -33,6 +33,7 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
@@ -84,6 +85,8 @@ static void render_graph(void);
 static void render_status(void);
 static void display_task(void *arg);
 static void apply_panel_rotation(uint8_t degrees);
+static void logo_init(void);
+static void logo_render_frame(int cx, int cy);
 
 static esp_lcd_panel_handle_t s_panel = NULL;
 static esp_lcd_panel_io_handle_t s_io = NULL;
@@ -123,7 +126,13 @@ typedef enum {
 #define STATUS_LINE_LEN    48
 
 #define DISPLAY_TASK_STACK 4096
-#define STATUS_FRAME_MS    1000  /* status refresh cadence (live RSSI) */
+/* Status refresh cadence. Doubles as the frame clock for the animated brand
+ * badge (10 fps — deliberately modest; the therapy graph streams at 25 Hz).
+ * The badge's phase follows a logical clock that never advances more than
+ * ~1.25 frames at a step, so a late or interrupted render slows the
+ * animation briefly instead of letting it jump/stutter. Raise this to save
+ * power at the cost of smoothness. */
+#define STATUS_FRAME_MS    100
 
 /* ── Flow graph layout (static, non-adaptive) ───────────────────────────
  * GRAPH_FULL_SCALE is the fixed full-scale deflection (L/min) from the zero
@@ -161,6 +170,15 @@ static float *s_flow_local;   /* render-task snapshot */
 static float *s_flow_yf;      /* render-task y coordinates */
 static int    s_flow_head = 0;
 static int    s_flow_count = 0;
+
+/* Screenshot support. The framebuffer has a single owner (the render task),
+ * so captures are requested via s_snap_want and performed inside
+ * display_task; callers read the finished copy from s_snap_buf. All three
+ * flags are guarded by s_state_mutex. */
+static uint16_t *s_snap_buf = NULL;          /* module-owned snapshot buffer */
+static SemaphoreHandle_t s_snap_sem = NULL;  /* given when a copy completes */
+static bool s_snap_want = false;             /* copy requested, not yet done */
+static bool s_snap_busy = false;             /* caller is reading s_snap_buf */
 
 /* ── Public state-mutating API (never draws; render task handles drawing) ── */
 
@@ -237,6 +255,46 @@ void bsp_display_push_flow(float flow_lpm)
     /* Wake the render task so the graph advances at the data rate. Multiple
      * notifications between renders coalesce into a single redraw. */
     if (notify && s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+const uint16_t *bsp_display_snapshot_take(uint32_t timeout_ms)
+{
+    if (!s_state_mutex || !s_snap_sem || !s_snap_buf ||
+        !s_display_task || !s_fb) return NULL;
+
+    bool queued = false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_snap_busy) {
+        xSemaphoreGive(s_state_mutex);
+        return NULL;   /* previous snapshot not released yet */
+    }
+    if (!s_snap_want) {
+        s_snap_want = true;
+        queued = true;
+    }
+    xSemaphoreGive(s_state_mutex);
+
+    /* A request that timed out earlier may still be queued; the semaphore is
+     * answered by whichever copy completes, and s_snap_buf always holds one
+     * coherent frame once it does. */
+    if (queued) xTaskNotifyGive(s_display_task);
+
+    const uint16_t *frame = NULL;
+    if (xSemaphoreTake(s_snap_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        s_snap_busy = true;
+        xSemaphoreGive(s_state_mutex);
+        frame = s_snap_buf;
+    }
+    return frame;
+}
+
+void bsp_display_snapshot_release(void)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_snap_busy = false;
+    xSemaphoreGive(s_state_mutex);
 }
 
 /* ── Framebuffer → panel blit ───────────────────────────────────────── */
@@ -636,9 +694,19 @@ esp_err_t bsp_display_init(void)
         }
     }
 
+    /* Bake the animated brand watermark's static emblem layer (non-fatal on
+     * failure — the status screen renders normally without it). */
+    logo_init();
+
     /* Create the state mutex and start the single-owner render task. Only this
      * task ever touches the framebuffer or the LCD panel. */
     s_state_mutex = xSemaphoreCreateMutex();
+    s_snap_sem = xSemaphoreCreateBinary();
+    s_snap_buf = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
+                                  MALLOC_CAP_SPIRAM);
+    if (!s_snap_sem || !s_snap_buf) {
+        ESP_LOGW(TAG, "screenshot buffers unavailable; capture API disabled");
+    }
     if (s_state_mutex) {
         s_display_task = psram_task_create(display_task, "display", DISPLAY_TASK_STACK, NULL, 4, tskNO_AFFINITY, NULL, NULL);
     } else {
@@ -1050,6 +1118,387 @@ static void fb_draw_battery_indicator(int x, int y, int percent, bool charging)
     }
 }
 
+/* \u2550\u2550 Animated brand badge (status screen, title lockup) \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+ *
+ * Procedural re-creation of the animated emblem from the web UI
+ * (assets/svg/logo-small.svg \u2014 also served as /favicon.svg and embedded in
+ * /logo.svg), miniaturised to title size and placed to the LEFT of the
+ * status title as a lockup, mirroring the web header brand.
+ *
+ *   SVG element              | SMIL animation                  | Device implementation
+ *   -------------------------+---------------------------------+------------------------------------------------------
+ *   gradient disc + rim ring | static                          | baked once into an offscreen sprite
+ *   accent ring (r=216u)     | opacity 0.15\u21920.38\u21920.15, 4.8 s   | plotted circle, pulsing alpha + halo
+ *   waveform                 | translate x \u2212400 u / 4 s        | per-column sine spans drifting left (period \u2248 5.3 s)
+ *   waveform glow            | feGaussianBlur 3.8\u21927.2, 4.8 s   | wider low-alpha span pass, pulsing
+ *   echo wave                | opacity 0.10\u21920.26\u21920.10, 4.8 s   | thin second span pass (culled below ~1 px stroke)
+ *   crescent moon            | opacity 0.68\u21921\u21920.68, 6 s        | two-circle coverage mask, breathing alpha
+ *   3 stars                  | staggered opacity pulses        | radial-coverage dots (culled below ~1 px radius)
+ *
+ * Layout contract: render_status() centres the [emblem + gap + title]
+ * group, so the badge shifts ONLY the title (right by half of emblem+gap
+ * compared to plain centring); every other element keeps its exact
+ * coordinates. When there is no title \u2014 or it is too wide to share its row
+ * with the emblem \u2014 the badge is skipped and the legacy centred-title
+ * layout is used.
+ *
+ * Animation pacing: the phase comes from a logical clock that advances by
+ * the real inter-frame interval CLAMPED to ~1.25 nominal frames. In steady
+ * state the animation runs at exactly real-time speed; if a render is late
+ * or interrupted (notification burst, mode switch), the animation briefly
+ * slows instead of jumping forward \u2014 smooth and consistent, never
+ * stuttering to catch up.
+ *
+ * Scale awareness: stroke widths derive from the SVG geometry (with a
+ * legibility floor), and elements that would be smaller than ~1 px at the
+ * chosen LOGO_SIZE (stars, echo wave) are culled rather than shimmered.
+ */
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define LOGO_SIZE       36                      /* emblem diameter \u2248 title glyph height (roboto_title: 33) */
+#define LOGO_SCALE      (LOGO_SIZE / 512.0f)    /* SVG unit \u2192 device px */
+#define LOGO_GAP        7                       /* gap between emblem and title text */
+#define LOGO_DROP_PX    4                       /* emblem nudged below the title's visual mid */
+
+#define LOGO_DIM_PCT    100     /* foreground badge: faithful web colours (knob kept for tuning) */
+
+/* Geometry carried over from the SVG viewBox (values in SVG units). */
+#define LOGO_R_DISCU    248     /* outer disc edge          */
+#define LOGO_R_RIMU     236     /* rim ring radius          */
+#define LOGO_RIM_HALFWU 4       /* rim stroke half-width    */
+#define LOGO_R_RINGU    216     /* accent ring radius       */
+#define LOGO_R_CLIPU    205     /* waveform clip circle     */
+#define LOGO_WAVE_BASEU 22      /* wave baseline below ctr  */
+#define LOGO_WAVE_AMPU  80      /* crest/trough amplitude   */
+#define LOGO_WAVE_LENU  400     /* wavelength               */
+/* Leftward drift, in SVG units per second. Holding the UNIT rate constant
+ * preserves the animation's temporal rhythm at any icon size (crest-to-crest
+ * period = λ/v = 400/75 ≈ 5.3 s); the pixel speed simply scales with
+ * LOGO_SIZE (31 px/s at 212 px, 5.3 px/s at 36 px). Slightly quicker than
+ * the web original (100 u/s would be the faithful rate) per user preference. */
+#define LOGO_WAVE_SPEEDU 75
+
+/* Baked static emblem: RGB565 colours + per-pixel coverage for the gradient
+ * disc and rim ring (allocated once; a few KB).  If allocation fails the
+ * badge silently stays off and the title falls back to plain centring. */
+static uint16_t *s_logo_rgb = NULL;
+static uint8_t  *s_logo_a   = NULL;
+static bool      s_logo_ok  = false;
+
+/* Logical animation clock (render-task-private). */
+static int64_t  s_logo_last_us = -1;    /* last frame's esp_timer reading */
+static float    s_logo_anim_t  = 0.0f;  /* smoothed animation time (s)    */
+
+/* Per-column scratch for the wave spans (render-task-private). */
+#define LOGO_SPAN_MAX   180     /* covers any LOGO_SIZE up to 212 px */
+static float s_logo_y_main[LOGO_SPAN_MAX];
+static float s_logo_y_echo[LOGO_SPAN_MAX];
+static bool  s_logo_col_ok[LOGO_SPAN_MAX];
+
+/* Triangle ramp 0\u21921\u21920 over period_s \u2014 matches SMIL values="lo;hi;lo" with an
+ * optional begin offset \u2014 evaluated at logical time t seconds. */
+static inline float logo_pulse(float t, float period_s, float begin_s)
+{
+    float ph = (t - begin_s) / period_s;
+    ph -= floorf(ph);
+    return 1.0f - fabsf(2.0f * ph - 1.0f);
+}
+
+/* Map an opacity in [lo,hi] as authored in the SVG through the global
+ * dimmer to an 8-bit blend alpha. */
+static inline uint8_t logo_alpha(float lo, float hi, float k)
+{
+    float o = (lo + (hi - lo) * k) * (LOGO_DIM_PCT / 100.0f);
+    if (o <= 0.0f) return 0;
+    if (o >= 1.0f) return 255;
+    return (uint8_t)(o * 255.0f + 0.5f);
+}
+
+static inline float logo_clamp01(float v)
+{
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+/* Vertical wave gradient sampled by the wave's vertical position across its
+ * full peak-to-peak travel \u2014 same colour stops and offsets (0 / 40 % / 100 %)
+ * as the SVG's waveGrad: #A5F3FC \u2192 #22D3EE \u2192 #818CF8. */
+static uint16_t logo_wave_color(float rel /* px from emblem centre */)
+{
+    const float tt = logo_clamp01((rel - (LOGO_WAVE_BASEU - LOGO_WAVE_AMPU) * LOGO_SCALE) /
+                                  (2.0f * LOGO_WAVE_AMPU * LOGO_SCALE));
+    uint8_t r, g, b;
+    if (tt < 0.40f) {
+        const float u = tt / 0.40f;
+        r = (uint8_t)(0xA5 + (0x22 - 0xA5) * u);
+        g = (uint8_t)(0xF3 + (0xD3 - 0xF3) * u);
+        b = (uint8_t)(0xFC + (0xEE - 0xFC) * u);
+    } else {
+        const float u = (tt - 0.40f) / 0.60f;
+        r = (uint8_t)(0x22 + (0x81 - 0x22) * u);
+        g = (uint8_t)(0xD3 + (0x8C - 0xD3) * u);
+        b = (uint8_t)(0xEE + (0xF8 - 0xEE) * u);
+    }
+    return rgb565(r, g, b);
+}
+
+static void logo_init(void)
+{
+    const size_t n = (size_t)LOGO_SIZE * LOGO_SIZE;
+    s_logo_rgb = heap_caps_malloc(n * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    s_logo_a   = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+    if (!s_logo_rgb || !s_logo_a) {
+        ESP_LOGW(TAG, "badge sprite alloc failed \\u2014 animated emblem disabled");
+        if (s_logo_rgb) { heap_caps_free(s_logo_rgb); s_logo_rgb = NULL; }
+        if (s_logo_a)   { heap_caps_free(s_logo_a);   s_logo_a   = NULL; }
+        return;
+    }
+
+    const float c = LOGO_SIZE * 0.5f;   /* disc centre inside the sprite */
+    for (int y = 0; y < LOGO_SIZE; y++) {
+        for (int x = 0; x < LOGO_SIZE; x++) {
+            const int i = y * LOGO_SIZE + x;
+            const float dx = x + 0.5f - c;
+            const float dy = y + 0.5f - c;
+            const float dist = sqrtf(dx * dx + dy * dy);
+
+            float cov = LOGO_R_DISCU * LOGO_SCALE + 0.5f - dist;  /* AA disc edge */
+            if (cov <= 0.0f) {
+                s_logo_a[i] = 0;
+                continue;
+            }
+            if (cov > 1.0f) cov = 1.0f;
+
+            /* Diagonal linear gradient #0B1D36 \u2192 #122B4A (SVG bgGrad). */
+            const float gt = (float)(x + y) / (float)(2 * (LOGO_SIZE - 1));
+            float r = 0x0B + (0x12 - 0x0B) * gt;
+            float g = 0x1D + (0x2B - 0x1D) * gt;
+            float b = 0x36 + (0x4A - 0x36) * gt;
+
+            /* Rim ring #1E3A5F @ 55 % (SVG r=236, stroke-width=8). */
+            const float rc = LOGO_RIM_HALFWU * LOGO_SCALE + 0.5f -
+                             fabsf(dist - LOGO_R_RIMU * LOGO_SCALE);
+            if (rc > 0.0f) {
+                const float ro = (rc > 1.0f ? 1.0f : rc) * 0.55f;
+                r += (0x1E - r) * ro;
+                g += (0x3A - g) * ro;
+                b += (0x5F - b) * ro;
+            }
+
+            s_logo_rgb[i] = rgb565((uint8_t)r, (uint8_t)g, (uint8_t)b);
+            s_logo_a[i] = (uint8_t)(cov * 255.0f + 0.5f);
+        }
+    }
+    s_logo_ok = true;
+    ESP_LOGI(TAG, "animated brand badge ready (%dx%d sprite)", LOGO_SIZE, LOGO_SIZE);
+}
+
+/* Blend one pixel COLUMN of a vertical span [y0f, y1f] with per-row exact
+ * coverage.  Used to rasterise the badge waveforms: because the waves are
+ * functions of x, per-column spans avoid the double-covered endpoint pixels
+ * (and resulting alpha pile-up) that chained capsule segments would produce,
+ * and keep brightness independent of slope. */
+static void logo_vspan(int x, float y0f, float y1f, uint16_t col, uint8_t a)
+{
+    if (a == 0 || x < 0 || x >= LCD_H_RES) return;
+    const int y_lo = (int)floorf(y0f);
+    const int y_hi = (int)ceilf(y1f);
+    for (int y = y_lo; y < y_hi; y++) {
+        if (y < 0 || y >= LCD_V_RES) continue;
+        float cov = fminf((float)y + 1.0f, y1f) - fmaxf((float)y, y0f);
+        if (cov <= 0.0f) continue;
+        if (cov > 1.0f) cov = 1.0f;
+        fb_blend(x, y, col, (uint8_t)((float)a * cov + 0.5f));
+    }
+}
+
+/* Draw one animation frame of the badge centred at framebuffer position
+ * (cx, cy).  Called from render_status() only (render-task context), right
+ * after fb_clear(). */
+static void logo_render_frame(int cx, int cy)
+{
+    if (!s_logo_ok) return;
+
+    /* Logical animation clock: advance by the real elapsed interval, but
+     * never by more than ~1.25 nominal frames.  Steady state tracks wall
+     * time exactly; a late/interrupted render slows the animation briefly
+     * instead of jumping it forward. */
+    const int64_t now = esp_timer_get_time();
+    if (s_logo_last_us < 0) s_logo_last_us = now;
+    float dt = (float)(now - s_logo_last_us) * 1e-6f;
+    s_logo_last_us = now;
+    if (dt < 0.0f) dt = 0.0f;
+    const float max_step = (STATUS_FRAME_MS * 1.25f) / 1000.0f;
+    if (dt > max_step) dt = max_step;
+    s_logo_anim_t += dt;
+    const float t = s_logo_anim_t;
+
+    const float fx = (float)cx, fy = (float)cy;
+
+    /* ── 1. Baked emblem (gradient disc + rim ring) ──────────────────── */
+    const int ox = cx - LOGO_SIZE / 2, oy = cy - LOGO_SIZE / 2;
+    if (ox < 0 || oy < 0 ||
+        ox + LOGO_SIZE > LCD_H_RES || oy + LOGO_SIZE > LCD_V_RES) {
+        return;                          /* out of range: draw nothing */
+    }
+    const unsigned dim = (255u * LOGO_DIM_PCT) / 100u;
+    for (int y = 0; y < LOGO_SIZE; y++) {
+        uint16_t *dst = &s_fb[(oy + y) * LCD_H_RES + ox];
+        const uint16_t *src = &s_logo_rgb[y * LOGO_SIZE];
+        const uint8_t *sa = &s_logo_a[y * LOGO_SIZE];
+        for (int x = 0; x < LOGO_SIZE; x++) {
+            if (!sa[x]) continue;
+            const uint8_t fa = (uint8_t)(((unsigned)sa[x] * dim + 127u) / 255u);
+            if (fa) dst[x] = blend565(dst[x], src[x], fa);
+        }
+    }
+
+    /* ── 2. Accent ring, breathing (SVG opacity 0.15→0.38 over 4.8 s) ── */
+    const uint16_t ring_col = rgb565(0x22, 0xD3, 0xEE);
+    const uint8_t ring_a = logo_alpha(0.15f, 0.38f, logo_pulse(t, 4.8f, 0.0f));
+    const uint8_t ring_halo = (uint8_t)(ring_a / 3);
+    const float ring_r = LOGO_R_RINGU * LOGO_SCALE;
+    /* Step count proportional to the circumference (~1.4 steps/px) so the
+     * plotted ring gets even coverage without alpha pile-up at any size. */
+    int steps = (int)(6.2831853f * ring_r * 1.4f);
+    if (steps < 48) steps = 48;
+    if (steps > 900) steps = 900;
+    for (int i = 0; i < steps; i++) {
+        const float th = (float)i * (2.0f * (float)M_PI / (float)steps);
+        const float cs = cosf(th), sn = sinf(th);
+        fb_blend((int)(fx + ring_r * cs),
+                 (int)(fy + ring_r * sn), ring_col, ring_a);
+        /* Faint inner/outer halo stands in for the SVG's ringGlow blur. */
+        fb_blend((int)(fx + ring_r * cs - 0.7f),
+                 (int)(fy + ring_r * sn - 0.7f), ring_col, ring_halo);
+        fb_blend((int)(fx + ring_r * cs + 0.7f),
+                 (int)(fy + ring_r * sn + 0.7f), ring_col, ring_halo);
+    }
+
+    /* ── 3. Waveforms ───────────────────────────────────────────────────
+     * The SMIL translate becomes a phase term; the pattern drifts leftward
+     * at LOGO_WAVE_SPEEDU units/s, preserving the web loop's period at any
+     * icon size.  Stroke half-widths derive from the SVG strokes (main
+     * 12 u, echo 3.6 u) with a legibility floor.  Points beyond the SVG's
+     * r=205-unit clip circle are dropped, reproducing the clipPath. */
+    const float ph0 = 2.0f * (float)M_PI * (LOGO_WAVE_SPEEDU * LOGO_SCALE * t) /
+                      (LOGO_WAVE_LENU * LOGO_SCALE);
+    const uint16_t echo_col = rgb565(0x67, 0xE8, 0xF9);
+    const uint16_t glow_col = rgb565(0x22, 0xD3, 0xEE);
+    const uint8_t echo_a = logo_alpha(0.10f, 0.26f, logo_pulse(t, 4.8f, 0.0f));
+    const uint8_t glow_a = logo_alpha(0.07f, 0.15f, logo_pulse(t, 4.8f, 0.0f));
+    const uint8_t core_a = logo_alpha(1.0f, 1.0f, 0.0f);
+
+    float core_half = 6.0f * LOGO_SCALE;
+    if (core_half < 0.9f) core_half = 0.9f;
+    const float glow_half = core_half * 1.8f;
+    const float echo_half = 1.8f * LOGO_SCALE;
+    const bool draw_echo = (echo_half >= 0.55f);
+
+    int wx0 = (int)(fx - LOGO_R_CLIPU * LOGO_SCALE) - 1;
+    int wx1 = (int)(fx + LOGO_R_CLIPU * LOGO_SCALE) + 2;
+    if (wx0 < 0) wx0 = 0;
+    if (wx1 > LCD_H_RES) wx1 = LCD_H_RES;
+
+    const float clip2 = (LOGO_R_CLIPU * LOGO_SCALE) * (LOGO_R_CLIPU * LOGO_SCALE);
+    int npts = 0;
+    for (int x = wx0; x < wx1; x++, npts++) {
+        const float u = (float)x - fx;
+        const float ang = ph0 + 2.0f * (float)M_PI * u / (LOGO_WAVE_LENU * LOGO_SCALE);
+        const float s = sinf(ang);
+        const float ym = fy + LOGO_WAVE_BASEU * LOGO_SCALE - LOGO_WAVE_AMPU * LOGO_SCALE * s;
+        const float ye = fy + (LOGO_WAVE_BASEU + 11.0f) * LOGO_SCALE -
+                         (58.5f * LOGO_SCALE) * s;
+        const bool ok =
+            (u * u + (ym - fy) * (ym - fy) <= clip2) &&
+            (u * u + (ye - fy) * (ye - fy) <= clip2);
+        s_logo_col_ok[npts] = ok;
+        s_logo_y_main[npts] = ym;
+        s_logo_y_echo[npts] = ye;
+    }
+
+    /* Soft glow pass (stands in for pulseGlow), then core, then echo — one
+     * exact-coverage vertical span per column per pass. */
+    for (int j = 0; j < npts; j++) {
+        if (!s_logo_col_ok[j]) continue;
+        const int x = wx0 + j;
+        logo_vspan(x, s_logo_y_main[j] - glow_half, s_logo_y_main[j] + glow_half,
+                   glow_col, glow_a);
+        logo_vspan(x, s_logo_y_main[j] - core_half, s_logo_y_main[j] + core_half,
+                   logo_wave_color(s_logo_y_main[j] - fy), core_a);
+        if (draw_echo) {
+            logo_vspan(x, s_logo_y_echo[j] - echo_half, s_logo_y_echo[j] + echo_half,
+                       echo_col, echo_a);
+        }
+    }
+
+    /* ── 4. Crescent moon (two-circle coverage mask), breathing ──────── */
+    const uint16_t moon_col = rgb565(0xE0, 0xF2, 0xFE);
+    const uint8_t moon_a = logo_alpha(0.68f, 1.0f, logo_pulse(t, 6.0f, 0.0f));
+    {
+        const float mcx = fx + 52.0f * LOGO_SCALE, mcy = fy - 144.0f * LOGO_SCALE;
+        const float mr = 38.0f * LOGO_SCALE;
+        const float qcx = fx + 72.0f * LOGO_SCALE, qcy = fy - 156.0f * LOGO_SCALE;
+        const float qr = 31.0f * LOGO_SCALE;
+
+        const int bx0 = (int)(mcx - mr) - 1, bx1 = (int)(mcx + mr) + 2;
+        const int by0 = (int)(mcy - mr) - 1, by1 = (int)(mcy + mr) + 2;
+        for (int py = by0; py <= by1; py++) {
+            if (py < 0 || py >= LCD_V_RES) continue;
+            for (int px = bx0; px <= bx1; px++) {
+                if (px < 0 || px >= LCD_H_RES) continue;
+                const float fxx = px + 0.5f, fyy = py + 0.5f;
+                const float dmx = fxx - mcx, dmy = fyy - mcy;
+                float cov = mr + 0.5f - sqrtf(dmx * dmx + dmy * dmy);
+                if (cov <= 0.0f) continue;
+                if (cov > 1.0f) cov = 1.0f;
+                const float dqx = fxx - qcx, dqy = fyy - qcy;
+                float cut = sqrtf(dqx * dqx + dqy * dqy) - qr + 0.5f;
+                if (cut <= 0.0f) continue;   /* fully inside the cut-out circle */
+                if (cut > 1.0f) cut = 1.0f;
+                fb_blend(px, py, moon_col,
+                         (uint8_t)((float)moon_a * cov * cut + 0.5f));
+            }
+        }
+    }
+
+    /* ── 5. Stars, staggered twinkle (culled below ~1 px radius) ─────── */
+    static const struct {
+        float dx, dy, r;         /* position relative to disc centre + radius (SVG units) */
+        uint8_t cr, cg, cb;      /* fill colour */
+        float lo, hi;            /* SVG opacity range */
+        float period, begin;     /* twinkle timing (s) */
+    } stars[3] = {
+        { -114.0f, -104.0f, 6.5f, 0xA5, 0xB4, 0xFC, 0.28f, 1.00f, 2.7f, 0.0f },
+        {  -88.0f, -138.0f, 5.0f, 0x67, 0xE8, 0xF9, 0.22f, 0.90f, 3.3f, 0.7f },
+        {  134.0f,  -71.0f, 5.2f, 0x22, 0xD3, 0xEE, 0.22f, 0.95f, 3.0f, 1.2f },
+    };
+    for (int si = 0; si < 3; si++) {
+        const float sr = stars[si].r * LOGO_SCALE;
+        if (sr < 0.9f) continue;         /* sub-pixel at this icon size */
+        const uint8_t a = logo_alpha(stars[si].lo, stars[si].hi,
+                                     logo_pulse(t, stars[si].period, stars[si].begin));
+        if (!a) continue;
+        const float sx = fx + stars[si].dx * LOGO_SCALE;
+        const float sy = fy + stars[si].dy * LOGO_SCALE;
+        const int bx0 = (int)(sx - sr) - 1, bx1 = (int)(sx + sr) + 2;
+        const int by0 = (int)(sy - sr) - 1, by1 = (int)(sy + sr) + 2;
+        for (int py = by0; py <= by1; py++) {
+            if (py < 0 || py >= LCD_V_RES) continue;
+            for (int px = bx0; px <= bx1; px++) {
+                if (px < 0 || px >= LCD_H_RES) continue;
+                const float fxx = px + 0.5f - sx, fyy = py + 0.5f - sy;
+                float cov = sr + 0.5f - sqrtf(fxx * fxx + fyy * fyy);
+                if (cov <= 0.0f) continue;
+                if (cov > 1.0f) cov = 1.0f;
+                fb_blend(px, py, rgb565(stars[si].cr, stars[si].cg, stars[si].cb),
+                         (uint8_t)((float)a * cov + 0.5f));
+            }
+        }
+    }
+}
 /* Render the status screen. Snapshots content under the state mutex, then
  * draws without holding it. RSSI is read live each refresh. */
 static void render_status(void)
@@ -1078,6 +1527,32 @@ static void render_status(void)
     const uint16_t text_col = rgb565(255, 255, 255);
 
     fb_clear(bg);
+
+    /* ── Brand badge + title lockup placement ───────────────────────────
+     * The emblem sits left of the title and the pair is centred as one
+     * group, shifting the title right by half of emblem+gap. With no title
+     * (or one too wide to share the row) the badge is skipped and the
+     * legacy centred-title layout is used. Every other element keeps its
+     * exact coordinates. */
+    bool logo_show = false;
+    int logo_cx = 0, logo_cy = 0;
+    int title_x = -1;                       /* -1 → centred-title fallback */
+    if (title[0]) {
+        const int tw = str_width_aa(&roboto_title, title);
+        const int lockup_w = LOGO_SIZE + LOGO_GAP + tw;
+        if (lockup_w <= LCD_H_RES - 8) {
+            int gx = (LCD_H_RES - lockup_w) / 2;
+            if (gx < 4) gx = 4;
+            logo_cx = gx + LOGO_SIZE / 2;
+            logo_cy = 48 + roboto_title.ascender / 2 + LOGO_DROP_PX;   /* title mid, nudged down */
+            title_x = gx + LOGO_SIZE + LOGO_GAP;
+            logo_show = true;
+        }
+    }
+
+    if (logo_show) {
+        logo_render_frame(logo_cx, logo_cy);
+    }
 
     /* Clock display (top-left) */
     time_t now = time(NULL);
@@ -1112,7 +1587,7 @@ static void render_status(void)
     int y = 48;
     if (title[0]) {
         int w = str_width_aa(&roboto_title, title);
-        int x = (LCD_H_RES - w) / 2;
+        int x = (title_x >= 0) ? title_x : (LCD_H_RES - w) / 2;
         if (x < 4) x = 4;
         fb_draw_string_aa(x, y, &roboto_title, title, title_col);
         y += 40;
@@ -1193,6 +1668,19 @@ static void display_task(void *arg)
          * the data rate (25 Hz) with zero busy-polling; coalesced
          * notifications mean we never render more often than data arrives. */
         uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(STATUS_FRAME_MS));
+
+        /* Service screenshot requests. The copy must happen inside this task:
+         * it is the only writer of s_fb, which is what makes the image
+         * tear-free even while the graph streams at 25 Hz. */
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        bool snap_req = s_snap_want;
+        s_snap_want = false;
+        xSemaphoreGive(s_state_mutex);
+        if (snap_req && s_snap_buf) {
+            memcpy(s_snap_buf, s_fb,
+                   LCD_H_RES * LCD_V_RES * sizeof(uint16_t));
+            xSemaphoreGive(s_snap_sem);
+        }
 
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         disp_mode_t mode = s_mode;

@@ -803,6 +803,84 @@ static esp_err_t favicon_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ── Live screen capture (/api/screenshot) ────────────────────────────
+ * Serves the current framebuffer as a 24-bit uncompressed BMP — no encoder
+ * library needed. The pixel copy is produced by the display render task
+ * (sole owner of the framebuffer), so the image is coherent even while the
+ * therapy graph streams at 25 Hz. */
+
+static void bmp_put_u16le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+
+static void bmp_put_u32le(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static esp_err_t screenshot_get_handler(httpd_req_t *req)
+{
+    const uint32_t hdr_len = 54;   /* BITMAPFILEHEADER + BITMAPINFOHEADER */
+    const uint32_t img_len = (uint32_t)BSP_DISPLAY_FB_W * BSP_DISPLAY_FB_H * 3;
+    const uint32_t file_len = hdr_len + img_len;
+
+    const uint16_t *fb = bsp_display_snapshot_take(500);
+    if (!fb) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "display not ready");
+        return ESP_FAIL;
+    }
+
+    uint8_t *bmp = heap_caps_malloc(file_len, MALLOC_CAP_SPIRAM);
+    if (!bmp) {
+        bsp_display_snapshot_release();
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "out of memory");
+        return ESP_FAIL;
+    }
+
+    /* 40-byte BITMAPINFOHEADER, BI_RGB, bottom-up rows. Row stride is
+     * W*3 = 720 bytes, already 4-byte aligned, so no padding is needed. */
+    bmp[0] = 'B'; bmp[1] = 'M';
+    bmp_put_u32le(bmp + 2, file_len);
+    bmp_put_u32le(bmp + 10, hdr_len);
+    bmp_put_u32le(bmp + 14, 40);
+    bmp_put_u32le(bmp + 18, BSP_DISPLAY_FB_W);
+    bmp_put_u32le(bmp + 22, BSP_DISPLAY_FB_H);
+    bmp_put_u16le(bmp + 26, 1);    /* planes */
+    bmp_put_u16le(bmp + 28, 24);   /* bits per pixel */
+
+    /* Pixel array: rows stored bottom-up, each pixel B,G,R. rgb565() keeps
+     * the panel's wire byte order in memory, so un-swap to recover the plain
+     * RGB565 value, then expand the 5/6-bit fields to full 8-bit range. */
+    for (int y = 0; y < BSP_DISPLAY_FB_H; y++) {
+        const uint16_t *src =
+            fb + (size_t)(BSP_DISPLAY_FB_H - 1 - y) * BSP_DISPLAY_FB_W;
+        uint8_t *dst = bmp + hdr_len + (size_t)y * BSP_DISPLAY_FB_W * 3;
+        for (int x = 0; x < BSP_DISPLAY_FB_W; x++) {
+            uint16_t v = src[x];
+            uint16_t c = (uint16_t)((v >> 8) | (v << 8));
+            uint8_t r5 = (c >> 11) & 0x1F;
+            uint8_t g6 = (c >> 5) & 0x3F;
+            uint8_t b5 = c & 0x1F;
+            *dst++ = (uint8_t)((b5 << 3) | (b5 >> 2));
+            *dst++ = (uint8_t)((g6 << 2) | (g6 >> 4));
+            *dst++ = (uint8_t)((r5 << 3) | (r5 >> 2));
+        }
+    }
+
+    bsp_display_snapshot_release();
+
+    httpd_resp_set_type(req, "image/bmp");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    esp_err_t err = httpd_resp_send(req, (const char *)bmp, file_len);
+    heap_caps_free(bmp);
+    return err;
+}
+
 /* ── Cached status data ────────────────────────────────────────────
  * These values rarely change but are expensive to query (SD I/O for
  * f_getfree, flash I/O for NVS).  Caching avoids contending with large
@@ -2802,6 +2880,10 @@ static esp_err_t start_webserver(void)
 
     httpd_uri_t tz_db = { .uri = "/api/tz", .method = HTTP_GET, .handler = tz_get_handler };
     httpd_register_uri_handler(s_httpd, &tz_db);
+
+    /* Live screen capture (24-bit BMP of the current framebuffer) */
+    httpd_uri_t screenshot = { .uri = "/api/screenshot", .method = HTTP_GET, .handler = screenshot_get_handler };
+    httpd_register_uri_handler(s_httpd, &screenshot);
 
     httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler };
     httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
