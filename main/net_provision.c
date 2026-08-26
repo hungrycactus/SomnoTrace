@@ -51,6 +51,7 @@
 #include "bsp_audio.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_system.h"
@@ -88,6 +89,22 @@ static const char *TAG = "netprov";
  * scan across every configured network.  Without this the driver retries
  * one dead SSID forever and never fails over. */
 #define RECONNECT_TRIES_BEFORE_RESCAN  5
+
+/* A candidate sweep whose strongest result is below this is treated as
+ * unreliable (the sweep likely raced BLE activity or a busy AP and missed
+ * closer BSSes), triggering a rescan instead of pinning a far node.
+ * Judged per configured slot: a strong Network #2 must not mask a missing
+ * or weak Network #1. */
+#define NETPROV_RESCAN_BELOW_RSSI  (-75)
+
+/* Candidates at or below this can barely carry traffic; they are tried only
+ * after every stronger candidate has failed, so a distant Network #1 cannot
+ * pin the device while a close Network #2 sits unused. */
+#define NETPROV_USABLE_RSSI        (-80)
+
+/* A candidate this strong ends candidate hunting immediately: further sweeps
+ * cannot meaningfully improve on it, so don't spend boot time looking. */
+#define NETPROV_GOOD_ENOUGH_RSSI   (-65)
 
 static EventGroupHandle_t s_wifi_events;
 static int s_retry_num = 0;
@@ -249,15 +266,75 @@ static void link_mark_up(const char *ip)
     if (ap) free(ap);
 }
 
+static const char *auth_mode_str(wifi_auth_mode_t m)
+{
+    switch (m) {
+    case WIFI_AUTH_OPEN:              return "OPEN";
+    case WIFI_AUTH_WEP:               return "WEP";
+    case WIFI_AUTH_WPA_PSK:           return "WPA-PSK";
+    case WIFI_AUTH_WPA2_PSK:          return "WPA2-PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK:      return "WPA/WPA2-PSK";
+    case WIFI_AUTH_WPA_ENTERPRISE:    return "WPA-EAP";
+    case WIFI_AUTH_WPA2_ENTERPRISE:   return "WPA2-EAP";
+    case WIFI_AUTH_WPA2_WPA3_ENTERPRISE: return "WPA2/WPA3-EAP";
+    case WIFI_AUTH_WPA3_PSK:          return "WPA3-PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK:     return "WPA2/WPA3-PSK";
+    case WIFI_AUTH_WAPI_PSK:          return "WAPI-PSK";
+    case WIFI_AUTH_OWE:               return "OWE";
+    default:                          return "?";
+    }
+}
+
+static const char *disc_reason_str(int r)
+{
+    switch (r) {
+    case 1:  return "UNSPECIFIED";
+    case 2:  return "AUTH_EXPIRE";
+    case 3:  return "AUTH_LEAVE";
+    case 4:  return "ASSOC_EXPIRE";
+    case 5:  return "ASSOC_TOOMANY";
+    case 6:  return "NOT_AUTHED";
+    case 7:  return "NOT_ASSOCED";
+    case 8:  return "ASSOC_LEAVE";
+    case 9:  return "ASSOC_NOT_AUTHED";
+    case 15: return "4WAY_HANDSHAKE_TIMEOUT";
+    case 16: return "GROUP_KEY_TIMEOUT";
+    case 17: return "IE_4WAY_DIFFERS";
+    case 18: return "GROUP_CIPHER_INVALID";
+    case 19: return "PAIRWISE_CIPHER_INVALID";
+    case 20: return "AKMP_INVALID";
+    case 21: return "BAD_RSN_IE_VERSION";
+    case 22: return "BAD_RSN_IE_CAP";
+    case 200: return "BEACON_LOSS";
+    case 201: return "NO_AP_FOUND";
+    case 202: return "AUTH_FAIL";
+    case 203: return "ASSOC_FAIL";
+    case 204: return "HANDSHAKE_TIMEOUT";
+    case 205: return "CONNECTION_FAIL";
+    default: return "OTHER";
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
-    (void)arg; (void)data;
+    (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         if (s_connecting) {
             esp_wifi_connect();
         }
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        const wifi_event_sta_connected_t *c = (const wifi_event_sta_connected_t *)data;
+        if (c) {
+            ESP_LOGI(TAG, "associated: ssid='%.*s' bssid=" MACSTR " ch=%d auth=%s (%d)",
+                     c->ssid_len, (const char *)c->ssid,
+                     MAC2STR(c->bssid), c->channel,
+                     auth_mode_str(c->authmode), c->authmode);
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)data;
+        int rsn = d ? d->reason : 0;
+        ESP_LOGW(TAG, "sta disconnected: reason=%d (%s)", rsn, disc_reason_str(rsn));
         if (s_connected) {
             /* Link genuinely lost while up.  Publish that immediately — the
              * old code left s_connected/s_connected_ip stale, so the LCD and
@@ -453,15 +530,32 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
                  ssid, rec->bssid[0], rec->bssid[1], rec->bssid[2],
                  rec->bssid[3], rec->bssid[4], rec->bssid[5],
                  rec->primary, rec->rssi);
+    } else {
+        ESP_LOGI(TAG, "connecting to '%s' unpinned (FAST_SCAN picks first match)", ssid);
     }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    EventBits_t bits = 0;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    for (;;) {
+        bits = xEventGroupWaitBits(s_wifi_events,
+                                   WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                   pdFALSE, pdFALSE, pdMS_TO_TICKS(1000));
+        if (bits != 0) break;
+        TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(now - deadline) >= 0) break;
+        wifi_ap_record_t live;
+        if (esp_wifi_sta_get_ap_info(&live) == ESP_OK) {
+            ESP_LOGI(TAG, "association alive: bssid=" MACSTR " ch=%d rssi=%d",
+                     MAC2STR(live.bssid), live.primary, live.rssi);
+        }
+    }
+    if (bits == 0) {
+        ESP_LOGW(TAG, "'%s': no verdict after %d ms (timeout)", ssid, timeout_ms);
+    }
 
     esp_err_t result;
     if (bits & WIFI_CONNECTED_BIT) {
@@ -486,6 +580,36 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
     vEventGroupDelete(s_wifi_events);
     s_wifi_events = NULL;
     return result;
+}
+
+/* Directed-probe scan for one SSID: APs answer by name even when a wildcard
+ * sweep's per-channel dwell window missed them.  Returns the strongest
+ * responder. */
+static bool directed_probe_best(const char *ssid, wifi_ap_record_t *out)
+{
+    /* No custom scan_time here: the coexistence driver overrides active scan
+     * dwell whenever BT is enabled ("Should use default active scan time"
+     * warning) and manages channel time itself. */
+    wifi_scan_config_t probe_cfg = {
+        .ssid = (const uint8_t *)ssid,
+        .show_hidden = true,
+    };
+    if (esp_wifi_scan_start(&probe_cfg, true) != ESP_OK) return false;
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n == 0) return false;
+    if (n > 20) n = 20;
+    wifi_ap_record_t *rs = calloc(n, sizeof(wifi_ap_record_t));
+    if (!rs) return false;
+    esp_wifi_scan_get_ap_records(&n, rs);
+    int best = -1;
+    for (uint16_t j = 0; j < n; j++) {
+        if (best < 0 || rs[j].rssi > rs[best].rssi) best = j;
+    }
+    bool ok = best >= 0;
+    if (ok) *out = rs[best];
+    free(rs);
+    return ok;
 }
 
 esp_err_t netprov_try_connect(const struct netprov_config *cfg,
@@ -517,7 +641,9 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
     cand_t cands[NETPROV_MAX_SSID_SLOTS];
 
     for (int attempt = 1; attempt <= scan_retries; attempt++) {
-        wifi_scan_config_t scan_cfg = { .show_hidden = false };
+        /* Custom active-scan dwell is overridden by the coexistence driver
+         * whenever BT is up; leave timing at driver defaults. */
+        wifi_scan_config_t scan_cfg = { .show_hidden = true };
         esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
         if (scan_err != ESP_OK) {
             ESP_LOGW(TAG, "Wi-Fi scan failed (err=0x%x), retrying scan (%d/%d)", scan_err, attempt, scan_retries);
@@ -539,18 +665,24 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
 
         /* Build candidates in slot priority order (Network #1 first). Slots
          * whose SSID is not visible are skipped; within a slot, the strongest
-         * same-SSID AP is used. No cross-slot RSSI ranking — a farther
-         * Network #1 still wins over a closer Network #2. */
+         * same-SSID AP is used.  Slot priority holds among usable candidates;
+         * sub-floor ones are demoted to a last-resort pass (see
+         * NETPROV_USABLE_RSSI). */
         n_cands = 0;
         for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
             if (cfg->wifi[i].ssid[0] == '\0') continue;
             int best_rssi = -128;
             wifi_ap_record_t best_rec = {0};
             for (int j = 0; j < ap_count; j++) {
-                if (records && strcmp((char *)records[j].ssid, cfg->wifi[i].ssid) == 0
-                    && records[j].rssi > best_rssi) {
-                    best_rssi = records[j].rssi;
-                    best_rec = records[j];
+                if (records && strcmp((char *)records[j].ssid, cfg->wifi[i].ssid) == 0) {
+                    ESP_LOGI(TAG, "scan: '%s' bssid=" MACSTR " ch=%d rssi=%d auth=%s (%d)",
+                             cfg->wifi[i].ssid, MAC2STR(records[j].bssid),
+                             records[j].primary, records[j].rssi,
+                             auth_mode_str(records[j].authmode), records[j].authmode);
+                    if (records[j].rssi > best_rssi) {
+                        best_rssi = records[j].rssi;
+                        best_rec = records[j];
+                    }
                 }
             }
             if (best_rssi > -128) {
@@ -566,13 +698,82 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
             records = NULL;
         }
 
-        if (n_cands > 0) {
-            break; // Found candidate SSID(s)
+        /* A sweep that lands while BLE is connecting or the AP is busy can
+         * miss the strongest BSS entirely and return only distant siblings.
+         * Judge each configured slot independently: if any slot has nothing
+         * above the rescan floor, treat the sweep as unreliable and try
+         * again before settling for a -90 dBm connection. */
+        int weak_slot = -1;
+        int weak_rssi = 0;
+        bool none_visible = true;
+        int overall_best = -128;
+        /* Visit every configured slot even after finding a weak one:
+         * overall_best must reflect all of them for the good-enough skip. */
+        for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
+            if (cfg->wifi[i].ssid[0] == '\0') continue;
+            int slot_best = -128;
+            for (int k = 0; k < n_cands; k++) {
+                if (cands[k].slot == i && cands[k].rssi > slot_best) {
+                    slot_best = cands[k].rssi;
+                }
+            }
+            if (slot_best > -128) none_visible = false;
+            if (slot_best > overall_best) overall_best = slot_best;
+            if (slot_best < NETPROV_RESCAN_BELOW_RSSI && weak_slot < 0) {
+                weak_slot = i;
+                weak_rssi = slot_best;
+            }
+        }
+        if (weak_slot < 0 || overall_best >= NETPROV_GOOD_ENOUGH_RSSI) {
+            break; // every slot usable, or an excellent candidate makes further hunting pointless
         }
 
+        if (none_visible) {
+            ESP_LOGW(TAG, "no configured SSID visible, rescanning (%d/%d)...",
+                     attempt, scan_retries);
+        } else if (weak_rssi <= -128) {
+            ESP_LOGW(TAG, "'%s' not visible this sweep, rescanning (%d/%d)...",
+                     cfg->wifi[weak_slot].ssid, attempt, scan_retries);
+        } else {
+            ESP_LOGW(TAG, "'%s' best at %d dBm (< %d), sweep unreliable, rescanning (%d/%d)...",
+                     cfg->wifi[weak_slot].ssid, weak_rssi,
+                     NETPROV_RESCAN_BELOW_RSSI, attempt, scan_retries);
+        }
         if (attempt < scan_retries) {
-            ESP_LOGI(TAG, "SSID candidates not found in scan, retrying scan in 1s (%d/%d)...", attempt, scan_retries);
             vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    /* Last look for slots that stayed weak or missing through every sweep:
+     * a directed probe asks for the SSID by name, so an AP that wildcard
+     * sweeps kept missing gets one more chance to identify itself.  Also
+     * produces a definitive "not on 2.4 GHz air" verdict when it fails. */
+    for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
+        if (cfg->wifi[i].ssid[0] == '\0') continue;
+        int idx = -1;
+        for (int k = 0; k < n_cands; k++) {
+            if (cands[k].slot == i) { idx = k; break; }
+        }
+        if (idx >= 0 && cands[idx].rssi >= NETPROV_RESCAN_BELOW_RSSI) continue;
+        wifi_ap_record_t hit;
+        if (!directed_probe_best(cfg->wifi[i].ssid, &hit)) {
+            ESP_LOGW(TAG, "directed probe '%s': no answer (SSID not on 2.4 GHz air right now)",
+                     cfg->wifi[i].ssid);
+            continue;
+        }
+        ESP_LOGI(TAG, "directed probe '%s': bssid=" MACSTR " ch=%d rssi=%d auth=%s (%d)",
+                 cfg->wifi[i].ssid, MAC2STR(hit.bssid), hit.primary, hit.rssi,
+                 auth_mode_str(hit.authmode), hit.authmode);
+        if (idx >= 0) {
+            if (hit.rssi > cands[idx].rssi) {
+                cands[idx].rssi = hit.rssi;
+                cands[idx].rec = hit;
+            }
+        } else {
+            cands[n_cands].slot = i;
+            cands[n_cands].rssi = hit.rssi;
+            cands[n_cands].rec = hit;
+            n_cands++;
         }
     }
 
@@ -586,13 +787,24 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
 
     if (s_portal_mode) return ESP_FAIL;
 
-    /* Try each visible candidate in slot priority order: 3 attempts, 5 s
-     * between retries. */
-    for (int i = 0; i < n_cands; i++) {
+    /* Try usable candidates first (slot priority order within each tier),
+     * sub-floor ones as a last resort.  3 attempts, 5 s between retries. */
+    int order[NETPROV_MAX_SSID_SLOTS];
+    int n_order = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n_cands; i++) {
+            if ((cands[i].rssi > NETPROV_USABLE_RSSI) == (pass == 0)) {
+                order[n_order++] = i;
+            }
+        }
+    }
+
+    for (int oi = 0; oi < n_order; oi++) {
         if (s_portal_mode) return ESP_FAIL;
+        int i = order[oi];
         int slot = cands[i].slot;
         ESP_LOGI(TAG, "trying candidate %d: '%s' (%d dBm)",
-                 i + 1, cfg->wifi[slot].ssid, cands[i].rssi);
+                 oi + 1, cfg->wifi[slot].ssid, cands[i].rssi);
 
         for (int attempt = 1; attempt <= MAX_STA_RETRY; attempt++) {
             /* Pin the scanned BSS on the first attempt only: if that exact
@@ -1106,6 +1318,9 @@ static void wifi_scan_task(void *arg)
             if (records[i].ssid[0] == '\0') continue;
             cJSON *o = cJSON_CreateObject();
             cJSON_AddStringToObject(o, "ssid", (char *)records[i].ssid);
+            char bss[18];
+            snprintf(bss, sizeof(bss), MACSTR, MAC2STR(records[i].bssid));
+            cJSON_AddStringToObject(o, "bssid", bss);
             cJSON_AddNumberToObject(o, "rssi", records[i].rssi);
             cJSON_AddBoolToObject(o, "lock", records[i].authmode != WIFI_AUTH_OPEN);
             cJSON_AddItemToArray(arr, o);
