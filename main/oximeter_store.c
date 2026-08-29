@@ -376,6 +376,105 @@ void ox_store_part_remove(const char *name)
     remove(path);
 }
 
+/* Shared promotion path: validate inbox/<name>.part, copy it verbatim to
+ * files/<serial>/<dst_name>, remove the .part and index the recording.
+ * Validation mode:
+ *   trailer_rule  - OxyII Format-A: magic at file_size - 44 must be
+ *                   present; `finalised` reflects the check result.
+ *   !trailer_rule - native-format recordings: exact byte size match
+ *                   required, otherwise nothing is stored or indexed. */
+static bool ox_store_promote_impl(const char *serial, const char *name,
+                                  bool append_bin, bool trailer_rule,
+                                  long expected_size)
+{
+    char part_path[128];
+    snprintf(part_path, sizeof(part_path), "%s/%s.part", OXY_INBOX, name);
+
+    FILE *f = fopen(part_path, "rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    bool finalised;
+    if (trailer_rule) {
+        if (fsize < TRAILER_LEN) {
+            fclose(f);
+            return false;
+        }
+        uint8_t magic[4];
+        finalised = fseek(f, fsize - 44, SEEK_SET) == 0 &&
+                    fread(magic, 1, 4, f) == 4 &&
+                    memcmp(magic, TRAILER_MAGIC, 4) == 0;
+    } else {
+        if (expected_size <= 0 || fsize != expected_size) {
+            ESP_LOGE(TAG, "promote '%s': size mismatch (have %ld, want %ld) — not stored",
+                     name, fsize, expected_size);
+            fclose(f);
+            return false;
+        }
+        finalised = true;
+    }
+
+    /* Read the whole file into memory (files are typically < 300 KB). */
+    fseek(f, 0, SEEK_SET);
+    uint8_t *data = malloc(fsize);
+    if (!data) {
+        fclose(f);
+        ESP_LOGE(TAG, "promote: OOM %ld bytes", fsize);
+        return false;
+    }
+    int n = fread(data, 1, fsize, f);
+    fclose(f);
+    if (n != fsize) {
+        free(data);
+        return false;
+    }
+
+    /* Create files/<serial>/ directory. */
+    char serial_dir[160];
+    snprintf(serial_dir, sizeof(serial_dir), "%s/%s", OXY_FILES, serial);
+    mkdir(OXY_FILES, 0775);
+    mkdir(serial_dir, 0775);
+
+    /* Write the final file — native filename preserved when the caller
+     * does not request the legacy .bin suffix. */
+    char bin_path[256];
+    if (append_bin)
+        snprintf(bin_path, sizeof(bin_path), "%s/%s/%s.bin",
+                 OXY_FILES, serial, name);
+    else
+        snprintf(bin_path, sizeof(bin_path), "%s/%s/%s",
+                 OXY_FILES, serial, name);
+    f = fopen(bin_path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "cannot create %s", bin_path);
+        free(data);
+        return false;
+    }
+    fwrite(data, 1, fsize, f);
+    fclose(f);
+    free(data);
+
+    /* Remove the .part file. */
+    remove(part_path);
+
+    /* Update index. */
+    ox_store_index_add(serial, name, (uint32_t)fsize, finalised);
+
+    ESP_LOGI(TAG, "promoted %s (%ld bytes, finalised=%d)", bin_path, fsize, finalised);
+    return finalised;
+}
+
+/* Promote inbox/<name>.part verbatim after an exact byte-size check.
+ * Used for native-format recordings (legacy-ring .vld files). */
+bool ox_store_promote_exact(const char *serial, const char *name,
+                            long expected_size)
+{
+    return ox_store_promote_impl(serial, name, false, false, expected_size);
+}
+
 /* Promote a .part file to files/<serial>/<name>.vld if VLD3 header is valid.
  * Validation: version==3, body_len % 5 == 0, resolution is 2.0 or 4.0.
  * Returns true if promoted (finalised), false otherwise. */

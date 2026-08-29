@@ -73,3 +73,7 @@ typedef struct {
 /* Driver registrations — each driver .c file provides a const pointer. */
 extern const ox_driver_ops_t oxyii_driver_ops;
 extern const ox_driver_ops_t legacy_driver_ops;
+
+/* Driver-specific scanned name lookup (for display) */
+const char *legacy_get_scanned_name(const char *addr_str);
+const char *oxyii_get_scanned_name(const char *addr_str);

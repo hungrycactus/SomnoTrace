@@ -516,7 +516,6 @@ Wellue/Viatom O2 Ring S Pulse Oximeter
 <div class="form-group">
 <div id="ox-paired" class="ble-status-paired" style="display:none">
 <span class="paired-badge">● Paired</span> with <strong id="ox-dev-name">O2 Ring</strong>
-<br><span id="ox-dev-info" style="font-size:.82rem;color:var(--text-muted)"></span>
 </div>
 <div id="ox-unpaired">
 <button class="btn btn-outline btn-sm" type="button" onclick="oxScan()">
@@ -1215,6 +1214,13 @@ function switchTab(tabId) {
     });
     scanWifi();
   }
+
+  /* Always refresh Status tab from /api/status when opened. */
+  if (tabId === 'tab-status') {
+    fetch('/api/status').then(function(r) { return r.json(); }).then(function(d) {
+      loadStatusTab(d);
+    }).catch(function() {});
+  }
 }
 
 function setLoading(id, on) {
@@ -1796,9 +1802,13 @@ function loadStatusTab(d) {
   if (oxEl) {
     var ox = d.oximeter || {};
     var ost = ox.state || 'idle';
+    /* If paired but state is idle (race after pairing), treat as paired */
+    if (ox.paired && ost === 'idle') ost = 'paired';
     var olabels = {
       'idle': 'Not paired', 'scanning': 'Scanning…', 'connecting': 'Connecting…',
-      'pulling': 'Syncing…', 'paired': (ox.device && ox.device.serial) ? ox.device.serial : 'Paired', 'error': 'Error'
+      'pulling': 'Syncing…',
+      'paired': (ox.device && ox.device.scanned_name) ? ox.device.scanned_name + ' (' + (ox.device.protocol === 'legacy' ? 'Legacy' : 'OxyII') + ')' : (ox.device && ox.device.serial) ? ox.device.serial : 'Paired',
+      'error': 'Error'
     };
     var ocolors = {
       'idle': 'var(--text-muted)', 'scanning': 'var(--warning)', 'connecting': 'var(--warning)',
@@ -2080,7 +2090,8 @@ function oxScan() {
       var o = document.createElement('option');
       o.value = n.addr + '|' + (n.type || 'oxyii');
       var label = n.name + ' (' + n.rssi + ' dBm)';
-      if (n.type === 'legacy') label += ' — Gen1';
+      if (n.type === 'legacy') label += ' — Legacy';
+      else if (n.type === 'oxyii') label += ' — OxyII';
       o.textContent = label;
       sel.appendChild(o);
     });
@@ -2110,7 +2121,7 @@ function oxForget() {
 function oxPoll() {
   if (oxPollTimer) clearInterval(oxPollTimer);
   oxPollTimer = setInterval(function() {
-    if (!appWs || appWs.readyState !== WebSocket.OPEN) oxRefresh();
+    oxRefresh();
   }, 5000);
   oxRefresh();
 }
@@ -2135,17 +2146,19 @@ function updateOxUI(ox) {
     if (unp) unp.style.display = 'none';
     if (fgt) fgt.style.display = '';
     var dn = document.getElementById('ox-dev-name');
-    var di = document.getElementById('ox-dev-info');
-    if (dn) dn.textContent = (ox.device && ox.device.name_prefix) ? (ox.device.name_prefix + ' O2 Ring') : 'O2 Ring';
-    if (di && ox.device) {
-      var info = 'S/N: ' + (ox.device.serial || '--') + '  FW: ' + (ox.device.firmware || '--');
-      if (ox.device.driver === 'wellue_legacy') info += '  (Gen1)';
-      di.textContent = info;
+    var proto = ox.device ? (ox.device.protocol || (ox.device.driver === 'wellue_legacy' ? 'legacy' : 'oxyii')) : 'oxyii';
+    var protoLabel = proto === 'legacy' ? 'Legacy' : 'OxyII';
+    if (dn && ox.device) {
+      /* Use scanned_name if available (e.g., "O2Ring 5328"), fallback to name_prefix */
+      var displayName = ox.device.scanned_name || ox.device.name_prefix || 'O2 Ring';
+      dn.textContent = displayName + ' (' + protoLabel + ')';
     }
-    if (ox.state === 'connecting') { oxStatusMsg('Syncing…'); }
-    else if (ox.state === 'pulling') { oxStatusMsg('Syncing…'); }
-    else if (ox.state === 'scanning') { oxStatusMsg('Scanning…'); }
-    else { if (oxPollTimer) clearInterval(oxPollTimer); oxStatusMsg(''); }
+    if (ox.state === 'connecting' || ox.state === 'pulling' || ox.state === 'scanning') {
+      oxStatusMsg('Syncing…');
+    } else {
+      if (oxPollTimer) clearInterval(oxPollTimer);
+      oxStatusMsg('');
+    }
   } else {
     if (paired) paired.style.display = 'none';
     if (unp) unp.style.display = 'block';

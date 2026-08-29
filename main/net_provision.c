@@ -1014,6 +1014,12 @@ cJSON *netprov_build_status_json(void)
         if (oximeter_is_paired()) {
             cJSON *oinfo = oximeter_get_paired_info();
             if (oinfo) {
+                /* Add scanned name for display (e.g., "O2Ring 5328") */
+                cJSON *addr_item = cJSON_GetObjectItem(oinfo, "addr");
+                if (cJSON_IsString(addr_item)) {
+                    const char *scanned = oximeter_get_scanned_name(addr_item->valuestring);
+                    if (scanned) cJSON_AddStringToObject(oinfo, "scanned_name", scanned);
+                }
                 cJSON_AddItemToObject(ox, "device", oinfo);
             }
         }

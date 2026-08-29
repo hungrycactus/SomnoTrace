@@ -103,6 +103,10 @@ cJSON *oximeter_get_paired_info(void);
  * Returns OX_DRIVER_OXYII if not paired (default). */
 ox_driver_t oximeter_get_driver(void);
 
+/* Get the scanned device name for a given address (for display purposes).
+ * Returns NULL if not found in scan results. */
+const char *oximeter_get_scanned_name(const char *addr_str);
+
 /* Get/set the probe mode (see ox_probe_mode_t).  Persists to NVS.
  * The watch task picks up the new mode on its next iteration. */
 ox_probe_mode_t oximeter_get_probe_mode(void);

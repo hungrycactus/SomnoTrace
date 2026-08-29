@@ -1119,21 +1119,24 @@ static void pair_task(void *arg)
     memcpy(prefix, serial, 4);
     prefix[4] = '\0';
 
+    /* Look up scanned name from current scan results for display */
+    const char *scanned_name = oxyii_get_scanned_name(addr_str);
+
     /* Save to NVS */
     struct ox_nvs_arg nvs_arg;
     strlcpy(nvs_arg.serial, serial, sizeof(nvs_arg.serial));
     strlcpy(nvs_arg.firmware, firmware, sizeof(nvs_arg.firmware));
-    strlcpy(nvs_arg.name_prefix, prefix, sizeof(nvs_arg.name_prefix));
+    strlcpy(nvs_arg.name_prefix, scanned_name ? scanned_name : prefix, sizeof(nvs_arg.name_prefix));
     strlcpy(nvs_arg.last_addr, addr_str, sizeof(nvs_arg.last_addr));
     nvs_writer_run(do_save_nvs, &nvs_arg);
 
     /* Save to paired.json on SD */
-    ox_store_save_paired(serial, firmware, prefix, addr_str, "wellue_oxyii");
+    ox_store_save_paired(serial, firmware, scanned_name ? scanned_name : prefix, addr_str, "wellue_oxyii");
 
     /* Update in-RAM state */
     strlcpy(s_serial, serial, sizeof(s_serial));
     strlcpy(s_firmware, firmware, sizeof(s_firmware));
-    strlcpy(s_name_prefix, prefix, sizeof(s_name_prefix));
+    strlcpy(s_name_prefix, scanned_name ? scanned_name : prefix, sizeof(s_name_prefix));
     strlcpy(s_paired_addr, addr_str, sizeof(s_paired_addr));
     s_paired = true;
     s_presence_served = false;
@@ -1498,23 +1501,25 @@ static void pull_task(void *arg)
 /* ── Public API (driver vtable) ───────────────────────────────────── */
 static void oxyii_init(void)
 {
-    s_state_mtx = xSemaphoreCreateMutex();
-    s_ops_mtx   = xSemaphoreCreateMutex();
-    s_op_sem    = xSemaphoreCreateBinary();
-    s_conn_sem  = xSemaphoreCreateBinary();
-    s_resp_sem  = xSemaphoreCreateBinary();
-    s_scan_done = xSemaphoreCreateBinary();
+    if (!s_state_mtx) s_state_mtx = xSemaphoreCreateMutex();
+    if (!s_ops_mtx)   s_ops_mtx   = xSemaphoreCreateMutex();
+    if (!s_op_sem)    s_op_sem    = xSemaphoreCreateBinary();
+    if (!s_conn_sem)  s_conn_sem  = xSemaphoreCreateBinary();
+    if (!s_resp_sem)  s_resp_sem  = xSemaphoreCreateBinary();
+    if (!s_scan_done) s_scan_done = xSemaphoreCreateBinary();
     if (!s_state_mtx || !s_ops_mtx || !s_op_sem || !s_conn_sem ||
         !s_resp_sem || !s_scan_done)
         return;
 
-    s_scan = heap_caps_malloc(sizeof(struct ox_scan_result) * OX_SCAN_MAX,
-                              MALLOC_CAP_SPIRAM);
-    s_resp_buf = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
-    s_resp_payload = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
-    if (!s_scan || !s_resp_buf || !s_resp_payload) {
-        ESP_LOGE(TAG, "init: failed to allocate PSRAM buffers");
-        return;
+    if (!s_scan) {
+        s_scan = heap_caps_malloc(sizeof(struct ox_scan_result) * OX_SCAN_MAX,
+                                  MALLOC_CAP_SPIRAM);
+        s_resp_buf = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
+        s_resp_payload = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
+        if (!s_scan || !s_resp_buf || !s_resp_payload) {
+            ESP_LOGE(TAG, "init: failed to allocate PSRAM buffers");
+            return;
+        }
     }
 
     load_paired_from_nvs();
@@ -1629,6 +1634,20 @@ static const char *oxyii_get_status(void)
     return s_status;
 }
 
+/* Get the scanned device name for a given address. */
+const char *oxyii_get_scanned_name(const char *addr_str)
+{
+    if (!addr_str || !addr_str[0]) return NULL;
+    for (int i = 0; i < s_scan_count; i++) {
+        char a[18];
+        addr_to_str(&s_scan[i].addr, a, sizeof(a));
+        if (strcmp(a, addr_str) == 0 && s_scan[i].name[0]) {
+            return s_scan[i].name;
+        }
+    }
+    return NULL;
+}
+
 static const char *oxyii_get_error(void)
 {
     return s_error;
@@ -1646,6 +1665,7 @@ static cJSON *oxyii_get_paired_info(void)
     cJSON_AddStringToObject(info, "serial", s_serial);
     if (s_firmware[0]) cJSON_AddStringToObject(info, "firmware", s_firmware);
     if (s_name_prefix[0]) cJSON_AddStringToObject(info, "name_prefix", s_name_prefix);
+    if (s_name_prefix[0]) cJSON_AddStringToObject(info, "scanned_name", s_name_prefix);
     if (s_paired_addr[0]) cJSON_AddStringToObject(info, "addr", s_paired_addr);
     cJSON_AddStringToObject(info, "driver", "wellue_oxyii");
     return info;
