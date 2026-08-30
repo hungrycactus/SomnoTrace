@@ -189,8 +189,23 @@ void app_main(void)
         ESP_LOGW(TAG, "audio codec init failed — buzzer will be unavailable");
     }
 
-    /* 4c. Initialise BLE (AirSense 11 pairing). Non-fatal on failure.
-     * Runs after storage init + crash recovery (see 4b). */
+    /* 4c. Try to connect to configured Wi-Fi BEFORE BLE init.
+     * This allows custom active scan params (20ms/channel) to be honoured.
+     * When BLE is already running, ESP-IDF forces BT-coexistence-safe scan
+     * params and ignores our active scan dwell time. */
+    struct netprov_config cfg;
+    bool has_creds = netprov_load_config(&cfg);
+
+    char ip[16] = "0.0.0.0";
+    esp_err_t err = ESP_FAIL;
+    if (has_creds) {
+        const char *lines[] = { "Connecting to Wi-Fi..." };
+        show_status("SomnoTrace", lines, 1);
+        err = netprov_try_connect(&cfg, ip, 35000);
+    }
+
+    /* 4c-bis. Initialise BLE (AirSense 11 pairing). Non-fatal on failure.
+     * Runs after Wi-Fi connect attempt so active scan params are honoured. */
     if (as11_ble_init() != ESP_OK) {
         ESP_LOGE(TAG, "BLE init failed; CPAP pairing unavailable");
     }
@@ -203,7 +218,7 @@ void app_main(void)
         ESP_LOGE(TAG, "Oximeter init failed; O2 Ring sync unavailable");
     }
 
-    /* 4c-bis. BLE startup has begun, so reconnect can now establish whether
+    /* 4c-quater. BLE startup has begun, so reconnect can now establish whether
      * therapy is already running.  Only now is it safe to let the idle post
      * worker export days that boot recovery queued: doing it earlier could
      * run a multi-minute rebuild while a live session was trying to start. */
@@ -214,26 +229,13 @@ void app_main(void)
     therapy_alert_set_therapy_active_fn(bsp_display_is_therapy_active);
     therapy_alert_init();
 
-    /* 5. Load config from NVS. */
-    struct netprov_config cfg;
-    bool has_creds = netprov_load_config(&cfg);
-
-    /* 6. If BOOT was held at boot, force SoftAP regardless. */
+    /* 5. If BOOT was held at boot, force SoftAP regardless. */
     if (s_softap_requested) {
         ESP_LOGW(TAG, "BOOT long-press detected: forcing SoftAP");
         enter_softap(&cfg);
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
-    }
-
-    /* 7. Try to connect to configured Wi-Fi. */
-    char ip[16] = "0.0.0.0";
-    esp_err_t err = ESP_FAIL;
-    if (has_creds) {
-        const char *lines[] = { "Connecting to Wi-Fi..." };
-        show_status("SomnoTrace", lines, 1);
-        err = netprov_try_connect(&cfg, ip, 15000);
     }
 
     bool in_softap = false;

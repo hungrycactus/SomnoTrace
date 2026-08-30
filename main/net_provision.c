@@ -85,6 +85,43 @@ static const char *TAG = "netprov";
 #define WIFI_FAIL_BIT       BIT1
 #define MAX_STA_RETRY       3
 
+/* Map Wi-Fi disconnect reason codes to human-readable strings. */
+static const char *wifi_disconnect_reason_str(wifi_err_reason_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_UNSPECIFIED:                  return "unspecified";
+    case WIFI_REASON_AUTH_EXPIRE:                  return "auth_expire";
+    case WIFI_REASON_AUTH_LEAVE:                   return "auth_leave";
+    case WIFI_REASON_ASSOC_EXPIRE:                 return "assoc_expire";
+    case WIFI_REASON_ASSOC_TOOMANY:                return "assoc_toomany";
+    case WIFI_REASON_NOT_AUTHED:                   return "not_authed";
+    case WIFI_REASON_NOT_ASSOCED:                  return "not_assoced";
+    case WIFI_REASON_ASSOC_LEAVE:                  return "assoc_leave";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:             return "assoc_not_authed";
+    case WIFI_REASON_DISASSOC_PWRCAP_BAD:          return "pwrcap_bad";
+    case WIFI_REASON_DISASSOC_SUPCHAN_BAD:         return "supchan_bad";
+    case WIFI_REASON_IE_INVALID:                   return "ie_invalid";
+    case WIFI_REASON_MIC_FAILURE:                  return "mic_failure";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:       return "4way_handshake_timeout";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:     return "group_key_update_timeout";
+    case WIFI_REASON_IE_IN_4WAY_DIFFERS:           return "ie_in_4way_differs";
+    case WIFI_REASON_GROUP_CIPHER_INVALID:         return "group_cipher_invalid";
+    case WIFI_REASON_PAIRWISE_CIPHER_INVALID:      return "pairwise_cipher_invalid";
+    case WIFI_REASON_AKMP_INVALID:                 return "akmp_invalid";
+    case WIFI_REASON_UNSUPP_RSN_IE_VERSION:        return "unsupp_rsn_ie_version";
+    case WIFI_REASON_INVALID_RSN_IE_CAP:           return "invalid_rsn_ie_cap";
+    case WIFI_REASON_802_1X_AUTH_FAILED:           return "802_1x_auth_failed";
+    case WIFI_REASON_CIPHER_SUITE_REJECTED:        return "cipher_suite_rejected";
+    case WIFI_REASON_BEACON_TIMEOUT:               return "beacon_timeout";
+    case WIFI_REASON_NO_AP_FOUND:                  return "no_ap_found";
+    case WIFI_REASON_AUTH_FAIL:                    return "auth_fail (wrong password?)";
+    case WIFI_REASON_ASSOC_FAIL:                   return "assoc_fail";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:            return "handshake_timeout";
+    case WIFI_REASON_CONNECTION_FAIL:              return "connection_fail";
+    default:                                       return "unknown";
+    }
+}
+
 /* Failed reconnects to the current SSID before falling back to a full
  * scan across every configured network.  Without this the driver retries
  * one dead SSID forever and never fails over. */
@@ -283,6 +320,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             esp_wifi_connect();
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
+        const char *reason_str = wifi_disconnect_reason_str((wifi_err_reason_t)disc->reason);
+
         if (s_connected) {
             /* Link genuinely lost while up.  Publish that immediately — the
              * old code left s_connected/s_connected_ip stale, so the LCD and
@@ -290,10 +330,28 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             link_mark_down();
             bsp_display_set_wifi_connected(false);
             s_reconnect_tries = 0;
-            ESP_LOGW(TAG, "Wi-Fi link lost, reconnecting...");
+            ESP_LOGW(TAG, "Wi-Fi link lost, reconnecting... (reason=%s, rssi=%d)",
+                     reason_str, disc->rssi);
             esp_wifi_connect();
         } else if (s_connecting) {
-            if (s_retry_num < MAX_STA_RETRY) {
+            ESP_LOGW(TAG, "disconnected (reason=%s, rssi=%d)", reason_str, disc->rssi);
+
+            /* Fast-fail on auth failures: no point retrying wrong password
+             * or cipher mismatch.  The driver will not retry on these reasons. */
+            bool auth_failed = (disc->reason == WIFI_REASON_AUTH_FAIL ||
+                                disc->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+                                disc->reason == WIFI_REASON_ASSOC_NOT_AUTHED ||
+                                disc->reason == WIFI_REASON_CIPHER_SUITE_REJECTED ||
+                                disc->reason == WIFI_REASON_PAIRWISE_CIPHER_INVALID ||
+                                disc->reason == WIFI_REASON_GROUP_CIPHER_INVALID ||
+                                disc->reason == WIFI_REASON_AKMP_INVALID);
+
+            if (auth_failed) {
+                ESP_LOGE(TAG, "authentication failed — fast fail, no retries");
+                if (s_wifi_events) {
+                    xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
+                }
+            } else if (s_retry_num < MAX_STA_RETRY) {
                 s_retry_num++;
                 ESP_LOGI(TAG, "retry connect (%d/%d)", s_retry_num, MAX_STA_RETRY);
                 esp_wifi_connect();
@@ -530,8 +588,20 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
     cand_t cands[NETPROV_MAX_SSID_SLOTS];
 
     for (int attempt = 1; attempt <= scan_retries; attempt++) {
-        wifi_scan_config_t scan_cfg = { .show_hidden = false };
-        esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
+        /* Use active scan only before BLE init (boot) or in SoftAP mode.
+         * After BLE init, BT coexistence forces passive/default params;
+         * custom active params are ignored and generate warnings. */
+        wifi_scan_config_t scan_cfg = {
+            .show_hidden = false,
+        };
+        if (s_portal_mode) {
+            /* SoftAP: BLE is disconnected, active scan params are safe. */
+            scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+            scan_cfg.scan_time.active.min = 0;
+            scan_cfg.scan_time.active.max = 20;
+        }
+        /* In STA mode with BLE active, pass NULL for driver defaults. */
+        esp_err_t scan_err = esp_wifi_scan_start(s_portal_mode ? &scan_cfg : NULL, true);
         if (scan_err != ESP_OK) {
             ESP_LOGW(TAG, "Wi-Fi scan failed (err=0x%x), retrying scan (%d/%d)", scan_err, attempt, scan_retries);
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1523,6 +1593,14 @@ static esp_err_t save_post_handler(httpd_req_t *req)
                         }
                     }
                 } else {
+                    /* WPA2-PSK requires 8-63 chars. Reject empty/short passwords
+                     * to avoid saving invalid credentials that lock out the device. */
+                    if (strlen(pass) > 0 && strlen(pass) < 8) {
+                        char err[64];
+                        snprintf(err, sizeof(err), "password too short for '%s' (min 8 chars)", ssid);
+                        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
+                        return ESP_FAIL;
+                    }
                     strlcpy(cfg.wifi[saved_count].pass, pass, sizeof(cfg.wifi[saved_count].pass));
                 }
                 saved_count++;
