@@ -1593,8 +1593,8 @@ static esp_err_t save_post_handler(httpd_req_t *req)
                         }
                     }
                 } else {
-                    /* WPA2-PSK requires 8-63 chars. Reject empty/short passwords
-                     * to avoid saving invalid credentials that lock out the device. */
+                    /* WPA2-PSK requires 8-63 chars. Allow empty (open network),
+                     * reject 1-7 chars (invalid for WPA2). */
                     if (strlen(pass) > 0 && strlen(pass) < 8) {
                         char err[64];
                         snprintf(err, sizeof(err), "password too short for '%s' (min 8 chars)", ssid);
@@ -1616,6 +1616,24 @@ static esp_err_t save_post_handler(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs save failed");
             return ESP_FAIL;
         }
+
+        /* Verify-after-write: read back config and confirm passwords match intent */
+        struct netprov_config verify_cfg;
+        if (netprov_load_config(&verify_cfg) == ESP_OK) {
+            for (int i = 0; i < saved_count; i++) {
+                if (strcmp(verify_cfg.wifi[i].ssid, cfg.wifi[i].ssid) == 0) {
+                    if (strcmp(verify_cfg.wifi[i].pass, cfg.wifi[i].pass) != 0) {
+                        ESP_LOGE(TAG, "verify failed: password mismatch for '%s'", cfg.wifi[i].ssid);
+                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "config verify failed");
+                        return ESP_FAIL;
+                    }
+                }
+            }
+            ESP_LOGI(TAG, "config verify OK for %d networks", saved_count);
+        } else {
+            ESP_LOGW(TAG, "verify read-back failed, skipping verification");
+        }
+
         /* Invalidate cached config so /api/status returns the new SSID list */
         s_status_cache.cfg_valid = false;
         ESP_LOGI(TAG, "saved %d credentials", saved_count);
