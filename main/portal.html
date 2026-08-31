@@ -1288,6 +1288,8 @@ function onPassKeydown(el, e) {
     e.preventDefault();
     el.value = '';
     el.placeholder = 'Leave this empty for an open network, otherwise provide 8+ characters.';
+    el.setAttribute('data-touched', 'true');
+    markWifiDirty();
   }
 }
 
