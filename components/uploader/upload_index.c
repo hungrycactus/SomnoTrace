@@ -43,7 +43,7 @@ static const char *TAG = "up_index";
 
 /* ── Module state ─────────────────────────────────────────────────── */
 
-static upload_day_t *s_days[UPLOAD_MAX_DAYS_CAP];
+static upload_day_t **s_days = NULL;
 static int s_n_days = 0;
 
 static char s_be_names[UPLOAD_MAX_BACKENDS][UPLOAD_BACKEND_ID_LEN];
@@ -489,6 +489,12 @@ void upload_index_set_bundle_ok(int slot, uint64_t fp)
 esp_err_t upload_index_init(void)
 {
     if (s_ready) return ESP_OK;
+    if (!s_days) {
+        s_days = heap_caps_calloc(UPLOAD_MAX_DAYS_CAP, sizeof(*s_days),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_days) s_days = calloc(UPLOAD_MAX_DAYS_CAP, sizeof(*s_days));
+        assert(s_days);
+    }
     mkdir(UPLOAD_STATE_DIR, 0775);
     s_n_days = 0;
     s_ready = true;
@@ -502,7 +508,7 @@ esp_err_t upload_index_load(int max_days)
     if (max_days > UPLOAD_MAX_DAYS_CAP) max_days = UPLOAD_MAX_DAYS_CAP;
 
     /* Collect day numbers present on disk. */
-    static uint32_t found[UPLOAD_MAX_DAYS_CAP];
+    uint32_t found[UPLOAD_MAX_DAYS_CAP];
     int n_found = 0;
 
     DIR *dir = opendir(UPLOAD_STATE_DIR);

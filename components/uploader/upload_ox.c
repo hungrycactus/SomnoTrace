@@ -50,7 +50,7 @@ typedef struct {
     char remote[OX_MAX_BACKENDS_LOCAL][64];
 } ox_state_t;
 
-static ox_state_t s_states[UPLOAD_OX_MAX_UNITS];
+static ox_state_t *s_states = NULL;
 static bool s_loaded;
 
 static bool safe_component(const char *s, size_t max_len)
@@ -160,7 +160,13 @@ static cJSON *read_state(void)
 esp_err_t upload_ox_init(void)
 {
     if (s_loaded) return ESP_OK;
-    memset(s_states, 0, sizeof(s_states));
+    if (!s_states) {
+        s_states = heap_caps_calloc(UPLOAD_OX_MAX_UNITS, sizeof(*s_states),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_states) s_states = calloc(UPLOAD_OX_MAX_UNITS, sizeof(*s_states));
+        assert(s_states);
+    }
+    memset(s_states, 0, sizeof(*s_states) * UPLOAD_OX_MAX_UNITS);
     cJSON *root = read_state();
     cJSON *units = root ? cJSON_GetObjectItem(root, "units") : NULL;
     if (units && cJSON_IsArray(units)) {

@@ -435,6 +435,12 @@ esp_err_t netprov_init(void)
     esp_netif_set_hostname(s_netif_ap, dhname);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    /* Use dynamic TX buffers (PSRAM-preferred) instead of static (internal RAM).
+     * Each static buffer consumes ~1.6 KB of precious DRAM; switching to dynamic
+     * frees 16 buffers * 1.6 KB = ~25.6 KB. */
+    cfg.tx_buf_type = 1;           /* 1 = dynamic, 0 = static */
+    cfg.static_tx_buf_num = 0;
+    cfg.dynamic_tx_buf_num = 16;
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
