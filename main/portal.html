@@ -1266,6 +1266,54 @@ function togglePw(id) {
   }
 }
 
+/* ── WiFi Password Field Tracking ──────────────────────────────── */
+function onPassInput(el) {
+  if (!el) return;
+  var isSentinel = el.value === PW_SENTINEL_WIFI;
+  if (isSentinel) {
+    el.value = '';
+  }
+  // Show hint immediately when field is empty
+  if (el.value === '') {
+    el.placeholder = 'Leave this empty for an open network, otherwise provide 8+ characters.';
+  }
+  el.setAttribute('data-touched', 'true');
+}
+
+function onPassKeydown(el, e) {
+  if (!el) return;
+  var isSentinel = el.value === PW_SENTINEL_WIFI;
+  // Backspace/Delete on sentinel -> clear entire field
+  if (isSentinel && (e.key === 'Backspace' || e.key === 'Delete')) {
+    e.preventDefault();
+    el.value = '';
+    el.placeholder = 'Leave this empty for an open network, otherwise provide 8+ characters.';
+  }
+}
+
+function onPassBlur(el) {
+  if (!el) return;
+  var len = el.value.length;
+  // Validate: 0 (open) or 8+ (WPA2) OK, 1-7 invalid
+  var wasInvalid = el.getAttribute('data-invalid') === 'true';
+  var nowInvalid = (len > 0 && len < 8);
+  if (nowInvalid) {
+    el.style.borderColor = 'var(--danger)';
+    el.style.boxShadow = '0 0 0 3px rgba(248,113,113,0.3)';
+  } else {
+    el.style.borderColor = '';
+    el.style.boxShadow = '';
+  }
+  if (wasInvalid !== nowInvalid) {
+    el.setAttribute('data-invalid', nowInvalid ? 'true' : 'false');
+    updateSaveButton();  // Re-check save button state
+  }
+  // Show hint when empty
+  if (el.value === '') {
+    el.placeholder = 'Leave this empty for an open network, otherwise provide 8+ characters.';
+  }
+}
+
 /* ── Dirty State Tracking ──────────────────────────────────────── */
 var isDirty = { wifi: false, upload: false, tz: false };
 
@@ -1316,14 +1364,23 @@ function updateSaveButton() {
   var footer = document.getElementById('save-footer');
   var msg = document.getElementById('save-msg');
   var dirty = isDirty.wifi || isDirty.upload || isDirty.tz;
-  if (btn) btn.disabled = !dirty;
+
+  // Check for invalid password fields (1-7 chars)
+  var hasInvalidPass = document.querySelector('input[id^="pass-"][data-invalid="true"]') !== null;
+
+  if (btn) btn.disabled = !dirty || hasInvalidPass;
   if (footer) {
     if (dirty) footer.classList.add('dirty');
     else footer.classList.remove('dirty');
   }
   if (msg) {
-    msg.textContent = dirty ? 'You have unsaved changes' : 'No changes to save';
-    msg.style.color = dirty ? 'var(--text)' : 'var(--text-muted)';
+    if (hasInvalidPass) {
+      msg.textContent = 'Fix password length (8+ chars or leave empty for open)';
+      msg.style.color = 'var(--danger)';
+    } else {
+      msg.textContent = dirty ? 'You have unsaved changes' : 'No changes to save';
+      msg.style.color = dirty ? 'var(--text)' : 'var(--text-muted)';
+    }
   }
 }
 
@@ -1464,7 +1521,7 @@ function renderWifiBlocks() {
 
     var passHtml = '<div class="form-group"><label>Password</label>';
     passHtml += '<div class="pw-wrap">';
-    passHtml += '<input id="pass-' + i + '" type="password" placeholder="' + (savedPasswords[i] ? '••••••••' : 'Password') + '" class="form-control" data-has-stored="' + (savedPasswords[i] ? 'true' : 'false') + '" data-dirty="false" oninput="markWifiDirty()">';
+    passHtml += '<input id="pass-' + i + '" type="password" placeholder="' + (savedPasswords[i] ? '••••••••' : 'Password') + '" class="form-control" data-has-stored="' + (savedPasswords[i] ? 'true' : 'false') + '" data-dirty="false" data-touched="false" oninput="markWifiDirty();onPassInput(this)" onkeydown="onPassKeydown(this, event)" onblur="onPassBlur(this)">';
     passHtml += '<button type="button" class="pw-toggle" onclick="togglePw(\'pass-' + i + '\')" aria-label="Toggle password">';
     passHtml += '<svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>';
     passHtml += '<svg viewBox="0 0 24 24" class="eye-closed" style="display:none"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46A11.8 11.8 0 0 0 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>';
@@ -1650,6 +1707,7 @@ function loadStatus(data) {
           if (passEl) {
             passEl.placeholder = '••••••••';
             passEl.setAttribute('data-has-stored', 'true');
+            passEl.value = PW_SENTINEL_WIFI;
           }
         }
       }
@@ -1840,8 +1898,14 @@ function saveAll() {
       var pass = passEl ? passEl.value : '';
       if (ssid) {
         if (body) body += '&';
-        // If password wasn't touched and there's a stored one, send sentinel
-        if (!pass && savedPasswords[i]) pass = PW_SENTINEL_WIFI;
+        // Three cases:
+        // 1. Password field not touched + stored password exists -> send sentinel (keep existing)
+        // 2. Password field touched + empty -> send empty string (user confirmed open network)
+        // 3. Password field has content -> send new password
+        var passTouched = passEl && passEl.getAttribute('data-touched') === 'true';
+        if (!pass && savedPasswords[i] && !passTouched) {
+          pass = PW_SENTINEL_WIFI;
+        }
         body += 'ssid' + (validCount + 1) + '=' + encodeURIComponent(ssid) + '&pass' + (validCount + 1) + '=' + encodeURIComponent(pass);
         validCount++;
       }
