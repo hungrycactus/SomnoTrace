@@ -382,6 +382,106 @@ body.fixed-height .logs-container{height:calc(100dvh - 145px);min-height:340px}
 .loading-overlay::before{content:'';position:absolute;inset:0;background:var(--card-bg);opacity:.9;z-index:5;border-radius:inherit}
 .loading-overlay::after{content:'';position:absolute;top:50%;left:50%;width:32px;height:32px;margin:-16px 0 0 -16px;border:3px solid var(--border-color);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;pointer-events:auto;box-shadow:0 0 12px var(--primary-glow);z-index:10}
 @keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── OTA Tabbed Interface ──────────────────────────────────────── */
+.ota-tabs{display:flex;justify-content:flex-start;gap:6px;margin-bottom:0;flex-wrap:wrap}
+.ota-tab{background:transparent;border:1px solid var(--border-color);border-bottom:none;border-radius:8px 8px 0 0;padding:8px 14px;cursor:pointer;display:flex;flex-direction:column;align-items:flex-start;gap:1px;min-width:120px;transition:background .2s,border-color .2s,color .2s;color:var(--text-muted);font-family:inherit;text-align:left;position:relative}
+.ota-tab:hover{background:var(--input-bg);color:var(--text)}
+.ota-tab.active{background:var(--card-bg);color:var(--text);border-color:var(--primary);border-bottom:1px solid var(--card-bg);position:relative;z-index:1;margin-bottom:-1px}
+.ota-tab .ota-tab-title{font-size:.85rem;font-weight:600;line-height:1.2}
+.ota-tab .ota-tab-sub{font-size:.7rem;font-weight:500;color:var(--text-muted);line-height:1.2}
+.ota-tab.active .ota-tab-sub{color:var(--text-muted);opacity:.85}
+.ota-tab-dot{position:absolute;top:13px;right:10px;width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 4px var(--success),0 0 8px rgba(52,211,153,.55);animation:otaDotPulse 1.8s ease-in-out infinite;flex-shrink:0}
+.ota-panel{background:var(--card-bg);border:1px solid var(--primary);border-radius:0 8px 8px 8px;padding:16px;display:none;flex-direction:column;gap:14px}
+.ota-panel.active{display:flex}
+@keyframes otaDotPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.7;transform:scale(1.15)}}
+@keyframes otaSpin{to{transform:rotate(360deg)}}
+.ota-progress{margin-top:6px;background:var(--input-bg);border-radius:6px;height:24px;overflow:hidden;border:1px solid var(--border-color)}
+.ota-progress-bar{height:100%;width:0%;background:var(--primary);transition:width .15s ease-out;border-radius:6px}
+.ota-progress-text{font-size:.8rem;color:var(--text-muted);margin-top:4px;text-align:center}
+.ota-filebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.ota-filename{font-size:.85rem;color:var(--text-muted);flex:1;min-width:140px;word-break:break-all}
+
+/* Internet Update panel: a single toolbar row with a left-side
+ * "[dot] Update vX.Y.Z to" hint, the version dropdown, an
+ * update-available dot, the refresh button, and the [Update] button
+ * on the right. The popover drops below the dropdown and sizes to its
+ * content (the version + date + pill of the longest row), not to the
+ * button width. The native <select> can't style individual options
+ * cross-browser, so we use a button + popover list where each row is
+ * its own DOM element we can color freely — that's how the green
+ * dot on the latest release survives into the popover. */
+.ota-internet-bar{position:relative;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ota-internet-hint{display:inline-flex;align-items:center;gap:6px;font-size:.85rem;color:var(--text-muted);white-space:nowrap}
+.ota-internet-hint #ota-hint-prefix,
+.ota-internet-hint #ota-hint-suffix{color:var(--text-muted);font-weight:400}
+.ota-internet-hint #ota-hint-version{color:var(--text);font-weight:700}
+.ota-internet-bar .ota-version-btn{flex:0 1 auto;min-width:0}
+.ota-internet-bar .btn{flex:0 0 auto;margin-left:auto}
+.ota-version-btn{background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:7px 12px;color:var(--text);font-size:.9rem;font-family:inherit;display:inline-flex;align-items:center;gap:8px;cursor:pointer;transition:border-color .2s,box-shadow .2s;text-align:left;max-width:100%}
+.ota-version-btn:hover{border-color:var(--primary)}
+.ota-version-btn:focus,.ota-version-btn[aria-expanded="true"]{border-color:var(--input-focus);box-shadow:0 0 0 3px var(--primary-glow);outline:none}
+.ota-version-btn-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:600}
+.ota-version-btn-upgrade{color:var(--success)}
+.ota-version-btn-caret{color:var(--text-muted);font-size:.7rem;flex-shrink:0;line-height:1;transition:transform .2s;margin-left:auto}
+.ota-version-btn[aria-expanded="true"] .ota-version-btn-caret{transform:rotate(180deg)}
+/* Standalone update-available indicator that sits between the dropdown
+ * and the refresh button when a newer release exists. */
+.ota-update-dot{width:9px;height:9px;border-radius:50%;background:var(--success);box-shadow:0 0 5px var(--success),0 0 10px rgba(52,211,153,.45);flex-shrink:0;animation:otaDotPulse 1.8s ease-in-out infinite;align-self:center}
+.ota-version-menu{position:absolute;top:100%;left:0;background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;padding:4px;list-style:none;max-height:240px;overflow-y:auto;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.35);display:flex;flex-direction:column;gap:1px;width:max-content}
+.ota-version-menu[hidden]{display:none}
+.ota-version-opt{padding:7px 10px;border-radius:6px;cursor:pointer;display:flex;align-items:center;gap:12px;font-size:.85rem;color:var(--text);transition:background .15s,color .15s;font-variant-numeric:tabular-nums;white-space:nowrap}
+.ota-version-opt:hover,.ota-version-opt:focus{background:var(--input-bg);outline:none}
+.ota-version-opt[aria-selected="true"]{background:var(--primary-glow);color:var(--text)}
+.ota-version-opt-tag{font-weight:600;color:var(--success)}
+.ota-version-opt-date{color:var(--text-muted);font-size:.78rem;font-weight:400;white-space:nowrap;margin-left:auto}
+.ota-version-opt-latest{font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:1px 6px;border-radius:8px;background:rgba(52,211,153,.18);color:var(--success);border:1px solid var(--success);line-height:1.4;margin-left:6px;flex-shrink:0}
+.ota-version-opt-newest .ota-version-opt-tag{font-weight:700}
+.ota-changelog-label{font-size:.72rem;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin:0}
+.ota-changelog-label-row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:0 0 2px 2px}
+.ota-changelog-warning{font-size:.72rem;color:var(--text-muted);font-weight:400;line-height:1.3}
+.ota-changelog{background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:10px 12px;min-height:200px;height:200px;overflow-y:auto;font-size:.78rem;line-height:1.5;color:var(--text);white-space:normal;word-break:break-word;resize:vertical}
+.ota-changelog-empty{color:var(--text-muted);font-style:italic;font-size:.84rem;text-align:center;padding:18px 0}
+.ota-changelog-body{font-size:.85rem;line-height:1.55;color:var(--text)}
+.ota-changelog-body p{margin:.5em 0}
+.ota-changelog-body p:first-child{margin-top:0}
+.ota-changelog-body p:last-child{margin-bottom:0}
+.ota-changelog-body h1,.ota-changelog-body h2,.ota-changelog-body h3,.ota-changelog-body h4{font-size:.92rem;font-weight:700;margin:.8em 0 .4em;color:var(--text);letter-spacing:0;text-transform:none}
+.ota-changelog-body h1:first-child,.ota-changelog-body h2:first-child,.ota-changelog-body h3:first-child,.ota-changelog-body h4:first-child{margin-top:0}
+.ota-changelog-body h2{font-size:.86rem}
+.ota-changelog-body h3,.ota-changelog-body h4{font-size:.82rem;color:var(--text-muted)}
+.ota-changelog-body ul,.ota-changelog-body ol{margin:.4em 0 .4em 1.3em;padding:0}
+.ota-changelog-body li{margin:.25em 0;padding-left:.1em}
+.ota-changelog-body li::marker{color:var(--text-muted)}
+.ota-changelog-body code{background:var(--card-bg);padding:1px 5px;border-radius:3px;font-size:.8em;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+.ota-changelog-body pre{background:var(--card-bg);border:1px solid var(--card-border);border-radius:6px;padding:8px 10px;overflow-x:auto;font-size:.78em;margin:.5em 0}
+.ota-changelog-body pre code{background:none;padding:0}
+.ota-changelog-body blockquote{margin:.5em 0;padding:.3em .8em;border-left:3px solid var(--border-color);color:var(--text-muted)}
+.ota-changelog-body a{color:var(--primary);text-decoration:underline}
+.ota-changelog-body hr{border:none;border-top:1px solid var(--card-border);margin:.8em 0}
+.ota-changelog-body strong{font-weight:700;color:var(--text)}
+.ota-changelog-body em{font-style:italic}
+/* Tighten the gap between the changelog and the status line so the
+ * vertical rhythm of the Internet panel matches the others. */
+#ota-panel-internet{gap:6px}
+
+/* Top nav-bar update indicator: small pulsing green dot to the left of the
+ * tab label. Hidden until otaRenderNavDot() reveals it. */
+.tab-btn-dot{width:8px;height:8px;border-radius:50%;background:var(--success);box-shadow:0 0 5px var(--success),0 0 10px rgba(52,211,153,.55);display:inline-block;margin-left:6px;flex-shrink:0;animation:otaDotPulse 1.8s ease-in-out infinite;vertical-align:middle}
+@media(max-width:600px){
+  .ota-tab{flex:1 1 30%;min-width:0;padding:6px 8px}
+  .ota-tab .ota-tab-title{font-size:.78rem}
+  .ota-tab .ota-tab-sub{font-size:.65rem}
+  .ota-panel{padding:12px;border-radius:0 6px 6px 6px}
+  /* On mobile, drop the fixed changelog height so the body always
+   * expands to fit; the browser doesn't support resize on touch
+   * devices anyway. */
+  .ota-changelog{height:auto;min-height:0;padding:12px 14px;resize:none}
+  .ota-version-menu{max-height:200px}
+  .ota-version-opt{font-size:.82rem;padding:7px 9px}
+  .ota-internet-bar{gap:6px}
+  .ota-internet-hint{font-size:.78rem}
+}
 </style>
 <link rel="stylesheet" href="/uplot.css">
 <script src="/uplot.js"></script>
@@ -398,7 +498,7 @@ body.fixed-height .logs-container{height:calc(100dvh - 145px);min-height:340px}
 <button class="tab-btn active" role="tab" id="tab-btn-dashboard" aria-selected="true" onclick="switchTab('dashboard')">Dashboard</button>
 <button class="tab-btn" role="tab" id="tab-btn-status" aria-selected="false" onclick="switchTab('tab-status')">Status</button>
 <button class="tab-btn" role="tab" id="tab-btn-logs" aria-selected="false" onclick="switchTab('logs')">Logs</button>
-<button class="tab-btn" role="tab" id="tab-btn-actions" aria-selected="false" onclick="switchTab('actions')">Actions</button>
+<button class="tab-btn" role="tab" id="tab-btn-actions" aria-selected="false" onclick="switchTab('actions')" title="An update is available">Actions<span class="tab-btn-dot" id="tab-actions-dot" aria-label="An update is available" style="display:none"></span></button>
 <button class="tab-btn" role="tab" id="tab-btn-settings" aria-selected="false" onclick="switchTab('settings')">Settings</button>
 </div>
 <div class="theme-selector">
@@ -1034,45 +1134,86 @@ Upload Progress
 <svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
 Firmware Update (OTA)
 </div>
-<p class="card-desc">Update the device firmware by downloading from a URL or uploading a .bin file. The device reboots automatically after a successful update.</p>
+<p class="card-desc">Update device firmware from the official Internet server, a direct URL, or a local file upload. The device reboots automatically after a successful update.</p>
 
-<div style="display:flex;flex-direction:column;gap:16px">
-<!-- ── URL download ── -->
-<div style="display:flex;flex-direction:column;gap:8px">
-<label style="font-size:.85rem;font-weight:600;color:var(--text)">Download from URL</label>
-<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-<input type="text" id="ota-url-input" placeholder="https://example.com/somnotrace-ota.bin" style="font-size:.85rem;flex:1;min-width:200px;padding:8px 10px;border-radius:6px;border:1px solid var(--border-color);background:var(--input-bg);color:var(--text)">
-<button class="btn btn-primary" id="ota-url-btn" onclick="otaUrlDownload()">Download &amp; Flash</button>
-</div>
-<button class="btn" id="ota-adventurous-btn" onclick="otaFetchLatest()" style="font-size:.8rem;align-self:flex-start;padding:6px 14px">&#127922; I'm Feeling Adventurous</button>
-<div id="ota-url-status" class="status-msg" style="margin-top:2px"></div>
-</div>
-
-<div style="border-top:1px solid var(--border-color);margin:4px 0"></div>
-
-<!-- ── File upload ── -->
-<div style="display:flex;flex-direction:column;gap:8px">
-<label style="font-size:.85rem;font-weight:600;color:var(--text)">Upload from File</label>
-<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-<input type="file" id="ota-file-input" accept=".bin" style="display:none">
-<button class="btn btn-outline" type="button" id="ota-choose-file-btn" onclick="document.getElementById('ota-file-input').click()">
-<svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
-Choose File
-</button>
-<span id="ota-file-name" style="font-size:.85rem;color:var(--text-muted);flex:1;min-width:140px;word-break:break-all">No file chosen</span>
-<button class="btn btn-primary" id="ota-upload-btn" onclick="otaUpload()" disabled>Upload &amp; Flash</button>
-</div>
+<!-- Compact left-aligned tab nav. Stacked title + subtext inside each tab.
+     Active tab is seamlessly connected to the panel below by sharing the
+     panel's background and inheriting its top border (see .ota-tab.active). -->
+<div class="ota-tabs" role="tablist" id="ota-tablist">
+  <button type="button" class="ota-tab active" role="tab" data-ota-tab="internet" aria-selected="true">
+    <span class="ota-tab-title">Internet Update</span>
+    <span class="ota-tab-sub">Fetch from cloud server</span>
+    <span class="ota-tab-dot" id="ota-internet-tab-dot" aria-label="An update is available" title="An update is available" style="display:none"></span>
+  </button>
+  <button type="button" class="ota-tab" role="tab" data-ota-tab="url" aria-selected="false">
+    <span class="ota-tab-title">Direct URL</span>
+    <span class="ota-tab-sub">Fetch file from web link</span>
+  </button>
+  <button type="button" class="ota-tab" role="tab" data-ota-tab="file" aria-selected="false">
+    <span class="ota-tab-title">Upload File</span>
+    <span class="ota-tab-sub">Choose a local file</span>
+  </button>
 </div>
 
-<!-- ── Shared progress + status ── -->
+<!-- Internet Update panel: left-side hint "[dot] Update vX.Y.Z to", the
+     version dropdown, refresh, and the Update button. Above the
+     changelog: a "Changes" section label. The popover <ul> lives inside
+     the bar so its position:absolute anchors to the bar's box. -->
+<div class="ota-panel active" id="ota-panel-internet" role="tabpanel">
+  <div class="ota-internet-bar">
+    <span class="ota-internet-hint" id="ota-internet-hint">
+      <span id="ota-hint-prefix">Update</span><span id="ota-hint-version">v&mdash;</span><span id="ota-hint-suffix"> to</span>
+    </span>
+    <button type="button" class="ota-version-btn" id="ota-version-btn" aria-haspopup="listbox" aria-expanded="false" onclick="otaToggleVersionMenu(event)">
+      <span class="ota-version-btn-label" id="ota-version-btn-label">Fetching&hellip;</span>
+      <span class="ota-version-btn-caret" aria-hidden="true">&#x25BE;</span>
+    </button>
+    <button class="btn btn-primary" id="ota-update-btn" onclick="otaUpdateSelected()" disabled>Update</button>
+    <ul class="ota-version-menu" id="ota-version-menu" role="listbox" hidden></ul>
+  </div>
+  <div class="ota-changelog-label-row">
+    <span class="ota-changelog-label">Changes</span>
+    <span class="ota-changelog-warning">&mdash; read the changelog carefully, releases may contain breaking changes</span>
+  </div>
+  <div class="ota-changelog" id="ota-changelog">
+    <div class="ota-changelog-empty">Select a version above to read its release notes.</div>
+  </div>
+</div>
+
+<!-- Direct URL panel: paste a URL, fetch and flash. Uses existing IDs so
+     otaUrlDownload() and otaFetchLatest() keep working unchanged. -->
+<div class="ota-panel" id="ota-panel-url" role="tabpanel">
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="text" id="ota-url-input" placeholder="https://example.com/somnotrace-ota.bin" style="font-size:.85rem;flex:1;min-width:200px;padding:8px 10px;border-radius:6px;border:1px solid var(--border-color);background:var(--input-bg);color:var(--text)">
+      <button class="btn btn-primary" id="ota-url-btn" onclick="otaUrlDownload()">Download &amp; Flash</button>
+    </div>
+    <button class="btn" id="ota-adventurous-btn" onclick="otaFetchLatest()" style="font-size:.8rem;align-self:flex-start;padding:6px 14px">&#127922; I'm Feeling Adventurous</button>
+    <div id="ota-url-status" class="status-msg" style="margin-top:2px"></div>
+  </div>
+</div>
+
+<!-- Upload File panel: choose a local .bin and flash. -->
+<div class="ota-panel" id="ota-panel-file" role="tabpanel">
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <div class="ota-filebar">
+      <input type="file" id="ota-file-input" accept=".bin" style="display:none">
+      <button class="btn btn-outline" type="button" id="ota-choose-file-btn" onclick="document.getElementById('ota-file-input').click()">
+        <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+        Choose File
+      </button>
+      <span id="ota-file-name" class="ota-filename">No file chosen</span>
+      <button class="btn btn-primary" id="ota-upload-btn" onclick="otaUpload()" disabled>Upload &amp; Flash</button>
+    </div>
+  </div>
+</div>
+
+<!-- Shared progress + status (spans all three tabs) -->
 <div id="ota-progress-wrap" style="display:none">
-<div style="background:var(--input-bg);border-radius:6px;height:24px;overflow:hidden;border:1px solid var(--border-color)">
-<div id="ota-progress-bar" style="height:100%;width:0%;background:var(--primary);transition:width .15s ease-out;border-radius:6px"></div>
-</div>
-<div id="ota-progress-text" style="font-size:.8rem;color:var(--text-muted);margin-top:4px;text-align:center">0%</div>
+  <div class="ota-progress"><div id="ota-progress-bar" class="ota-progress-bar"></div></div>
+  <div id="ota-progress-text" class="ota-progress-text">0%</div>
 </div>
 <div id="ota-status" class="status-msg" style="margin-top:4px"></div>
-</div>
 </div>
 
 <div class="card card-warning advanced-section mt-md">
@@ -1163,6 +1304,10 @@ function switchTab(tabId) {
   if (btn) { btn.classList.add('active'); btn.setAttribute('aria-selected', 'true'); }
   var sec = document.getElementById(tabId);
   if (sec) sec.classList.add('active');
+
+  /* The OTA check now runs automatically on WebSocket open and on each
+   * post-CPAP status update (throttled to once per 30 minutes). No
+   * per-tab-open trigger is needed. */
 
   if (tabId === 'dashboard') {
     if (dashThemeDirty) {
@@ -1703,6 +1848,13 @@ function formatSdSpace(total, free) {
 function loadStatusTab(d) {
   function setEl(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
   setEl('status-fw', d.fw_ver || '--');
+  /* Refresh the Internet Update version dropdown so the "Installed"
+   * marker and "Update to vX.Y.Z" hint stay in sync with the running
+   * firmware reported by /api/status. */
+  if (typeof otaOnlineReleases !== 'undefined' && otaOnlineReleases && otaOnlineReleases.length &&
+      typeof otaRenderVersionSelect === 'function') {
+    otaRenderVersionSelect(otaOnlineReleases);
+  }
 
   /* Wi-Fi link state from the new nested object, with fallback to the
    * old flat fields for backward compatibility. */
@@ -2636,12 +2788,14 @@ function otaSetBusy(busy) {
   var fileInput = document.getElementById('ota-file-input');
   var urlInput = document.getElementById('ota-url-input');
   var advBtn = document.getElementById('ota-adventurous-btn');
+  var updateBtn = document.getElementById('ota-update-btn');
   urlBtn.disabled = busy;
   uploadBtn.disabled = busy || !fileInput.files || !fileInput.files.length;
   if (chooseBtn) chooseBtn.disabled = busy;
   fileInput.disabled = busy;
   urlInput.disabled = busy;
   if (advBtn) advBtn.disabled = busy;
+  if (updateBtn && busy) updateBtn.disabled = true;
 }
 
 /* ── OTA: Download from URL ──────────────────────────────────────
@@ -2835,6 +2989,327 @@ function otaUpload() {
   xhr.send(file);
 }
 
+/* ── OTA tab switching (local to the Actions card) ───────────────
+ * Independent of the page-level switchTab(): the OTA section has its own
+ * sub-tabs that all share the same progress bar. */
+(function() {
+  var list = document.getElementById('ota-tablist');
+  if (!list) return;
+  list.addEventListener('click', function(e) {
+    var btn = e.target.closest ? e.target.closest('.ota-tab') : null;
+    if (!btn || !list.contains(btn)) return;
+    var key = btn.getAttribute('data-ota-tab');
+    if (!key) return;
+    document.querySelectorAll('#ota-tablist .ota-tab').forEach(function(t) {
+      var on = (t === btn);
+      t.classList.toggle('active', on);
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    document.querySelectorAll('.ota-panel').forEach(function(p) {
+      p.classList.toggle('active', p.id === 'ota-panel-' + key);
+    });
+  });
+})();
+
+/* Track the latest known online release so the Internet Update tab can
+ * show/hide the green dot and enable the Update... button. */
+var otaOnlineRelease = null;   /* { tag, version, asset:{name,url,size} } */
+var otaOnlineReleases = [];    /* full list from GitHub /releases */
+var otaReleaseByTag = null;    /* Map<tag, release> for O(1) lookups */
+
+/* Cached DOM refs (initialized on first render). */
+var otaDOM = {
+  menu: null, btnLabel: null, tabDot: null, hintVersion: null, btn: null,
+  chg: null, updateBtn: null, hint: null, fwEl: null
+};
+
+function otaInitDOM() {
+  if (otaDOM.menu) return;
+  otaDOM.menu = document.getElementById('ota-version-menu');
+  otaDOM.btnLabel = document.getElementById('ota-version-btn-label');
+  otaDOM.tabDot = document.getElementById('ota-internet-tab-dot');
+  otaDOM.hintVersion = document.getElementById('ota-hint-version');
+  otaDOM.btn = document.getElementById('ota-version-btn');
+  otaDOM.chg = document.getElementById('ota-changelog');
+  otaDOM.updateBtn = document.getElementById('ota-update-btn');
+  otaDOM.hint = document.getElementById('ota-internet-hint');
+  otaDOM.fwEl = document.getElementById('status-fw');
+}
+
+function otaRenderOnline() {
+  if (otaOnlineReleases && otaOnlineReleases.length) {
+    otaRenderVersionSelect(otaOnlineReleases);
+  }
+  otaRenderNavDot();
+}
+
+/* Show or hide the green dot on the "Actions" top-nav tab. Visible only
+ * when we have a known newer release than what's installed; the title
+ * on the button mirrors the same state. */
+function otaRenderNavDot() {
+  var dot = document.getElementById('tab-actions-dot');
+  var btn = document.getElementById('tab-btn-actions');
+  var show = !!(otaOnlineRelease && otaOnlineRelease.updateAvailable);
+  if (dot) dot.style.display = show ? 'inline-block' : 'none';
+  if (btn) btn.title = show ? 'An update is available' : '';
+}
+
+/* Pull the full release list from GitHub. Used both by the refresh button
+ * (just updates otaOnlineRelease) and by the version picker (renders the
+ * full list into the modal). Reuses the same endpoint as otaFetchLatest(). */
+function otaFetchReleases() {
+  return fetch('https://api.github.com/repos/ilyakruchinin/SomnoTrace/releases', {
+    headers: { 'Accept': 'application/vnd.github+json' }
+  }).then(function(r) {
+    if (!r.ok) throw new Error('GitHub API returned ' + r.status);
+    return r.json();
+  }).then(function(arr) {
+    if (!Array.isArray(arr) || !arr.length) throw new Error('No releases found');
+    arr.sort(function(a, b) { return (b.published_at || '').localeCompare(a.published_at || ''); });
+    /* Map each release to { tag, version, date, body, asset } so the rest
+     * of the OTA code never has to touch GitHub's release shape. */
+    return arr.map(function(rel) {
+      var asset = null;
+      if (rel.assets) {
+        for (var i = 0; i < rel.assets.length; i++) {
+          if (rel.assets[i].name && rel.assets[i].name.indexOf('-ota.bin') !== -1) {
+            asset = { name: rel.assets[i].name, url: rel.assets[i].browser_download_url, size: rel.assets[i].size || 0 };
+            break;
+          }
+        }
+      }
+      return {
+        tag: rel.tag_name,
+        version: (rel.tag_name || '').replace(/^v/, ''),
+        date: rel.published_at || '',
+        body: rel.body || '',
+        asset: asset,
+        prerelease: !!rel.prerelease
+      };
+    });
+  });
+}
+
+/* Identify which release the running firmware is on (best-effort: matches
+ * the version portion of "v1.3.0+dirty" / "1.3.0" against release tags). */
+function otaFindInstalledRelease(releases, installedBase) {
+  if (!installedBase) return null;
+  for (var i = 0; i < releases.length; i++) {
+    if (releases[i].version === installedBase) return releases[i];
+  }
+  return null;
+}
+
+/* Last time we ran the OTA check (ms epoch). Used to throttle the
+ * automatic post-CPAP re-check so we don't hammer GitHub on every
+ * status update. */
+var otaLastCheckAt = 0;
+
+function otaCheckForUpdate(source) {
+  if (!source) source = 'auto';
+  console.log('[OTA] check-for-update triggered: source=' + source +
+              ' lastCheckAt=' + otaLastCheckAt +
+              ' (' + Math.round((Date.now() - otaLastCheckAt) / 1000) + 's ago)');
+  otaLastCheckAt = Date.now();
+
+  otaFetchReleases().then(function(releases) {
+    otaOnlineReleases = releases;
+    var fwEl = document.getElementById('status-fw');
+    var installed = fwEl ? (fwEl.textContent || '').trim() : '';
+    var installedBase = installed.replace(/^v/, '').replace(/\+.*$/, '');
+    var installedRel = otaFindInstalledRelease(releases, installedBase);
+    /* Pick the newest stable release as "online newest". If only prereleases
+     * exist, fall back to the first prerelease so the user still sees
+     * something — the version picker lets them downgrade if needed. */
+    var newest = null;
+    for (var i = 0; i < releases.length; i++) {
+      if (releases[i].asset && !releases[i].prerelease) { newest = releases[i]; break; }
+    }
+    if (!newest) {
+      for (var j = 0; j < releases.length; j++) {
+        if (releases[j].asset) { newest = releases[j]; break; }
+      }
+    }
+    if (!newest) throw new Error('No *-ota.bin assets found in any release');
+    var newer = installedRel
+      ? releases.indexOf(newest) < releases.indexOf(installedRel)
+      : (installedBase === '' || newest.version !== installedBase);
+    otaOnlineRelease = { tag: newest.tag, version: newest.version, asset: newest.asset, updateAvailable: newer };
+    otaRenderOnline();
+    console.log('[OTA] check complete: installed=' + installed +
+                ' newest=' + newest.tag + ' newer=' + newer +
+                ' (source=' + source + ')');
+  }).catch(function(e) {
+    console.warn('[OTA] check failed (source=' + source + '): ' + (e.message || e));
+    otaOnlineRelease = null;
+    otaRenderOnline();
+  });
+}
+
+/* Throttled wrapper used for automatic checks (startup, post-CPAP). */
+function otaCheckForUpdateThrottled(source) {
+  if (Date.now() - otaLastCheckAt < 30 * 60 * 1000) {
+    console.log('[OTA] skipping auto-check (' + source + '): last check was ' +
+                Math.round((Date.now() - otaLastCheckAt) / 1000) + 's ago');
+    return;
+  }
+  otaCheckForUpdate(source);
+}
+
+/* Identify which release the user has selected in the dropdown. Used by
+ * otaApplySelection() to look up the asset URL when Update... is clicked.
+ * Set by otaRenderVersionSelect() and reset to null on errors / refresh. */
+var otaSelectedRelease = null;
+
+/* Build (or rebuild) the custom version dropdown from the GitHub release
+ * list. Releases are pre-sorted newest-first by otaFetchReleases(), and we
+ * trim the list at the currently installed version (inclusive) so the
+ * dropdown only ever shows what the user can actually flash onto their
+ * device. Each popover row is just the tag — the latest release also
+ * gets a green notification dot; older rows are bare. */
+function otaRenderVersionSelect(releases) {
+  otaInitDOM();
+  var menu = otaDOM.menu, btnLabel = otaDOM.btnLabel, tabDot = otaDOM.tabDot,
+      hintVersion = otaDOM.hintVersion, btn = otaDOM.btn, hint = otaDOM.hint,
+      fwEl = otaDOM.fwEl;
+  if (!menu || !btnLabel || !btn) return;
+
+  otaReleaseByTag = {};
+  for (var i = 0; i < releases.length; i++) otaReleaseByTag[releases[i].tag] = releases[i];
+
+  var installedBase = (fwEl ? (fwEl.textContent || '').trim() : '').replace(/^v/, '').replace(/\+.*$/, '');
+  var installedIdx = -1;
+  for (var i = 0; i < releases.length; i++) {
+    if (releases[i].version === installedBase) { installedIdx = i; break; }
+  }
+  var newerExists = installedIdx > 0;
+  var visible = newerExists ? releases.slice(0, installedIdx) : (installedIdx < 0 ? releases : []);
+
+  menu.innerHTML = '';
+  visible.forEach(function(rel, idx) {
+    var newest = (idx === 0);
+    var li = document.createElement('li');
+    li.className = 'ota-version-opt' + (newest ? ' ota-version-opt-newest' : '');
+    li.setAttribute('role', 'option');
+    li.setAttribute('data-tag', rel.tag);
+    var dateStr = rel.date ? rel.date.slice(0, 10) : '';
+    li.innerHTML = '<span class="ota-version-opt-tag">' + escHtml(rel.tag) + '</span>' +
+                   (newest ? '<span class="ota-version-opt-latest">Latest</span>' : '') +
+                   '<span class="ota-version-opt-date">' + escHtml(dateStr) + '</span>';
+    li.addEventListener('click', function() { otaApplySelection(rel.tag); otaCloseVersionMenu(); });
+    menu.appendChild(li);
+  });
+
+  var wantTag = visible.length ? visible[0].tag : null;
+  otaApplySelection(wantTag);
+
+  otaOnlineRelease = newerExists ? { tag: visible[0].tag, version: visible[0].version, asset: visible[0].asset, updateAvailable: true } : null;
+  otaRenderNavDot();
+  if (tabDot) tabDot.style.display = newerExists ? 'inline-block' : 'none';
+  if (hintVersion) hintVersion.textContent = newerExists ? ('v' + installedBase) : 'v—';
+  if (hint) hint.title = newerExists ? 'An update is available' : '';
+  if (btnLabel) btnLabel.classList.toggle('ota-version-btn-upgrade', !!newerExists);
+}
+
+/* Apply a selection by tag: update the closed-button label, the popover's
+ * aria-selected marker, and render that release's changelog. The closed
+ * button shows just the tag. The changelog is just the body — no
+ * top-of-card version/date/separator line. */
+function otaApplySelection(tag) {
+  otaInitDOM();
+  var btnLabel = otaDOM.btnLabel, menu = otaDOM.menu, chg = otaDOM.chg, updateBtn = otaDOM.updateBtn;
+  if (!btnLabel || !menu || !chg || !updateBtn) return;
+  var rel = otaReleaseByTag ? otaReleaseByTag[tag] : null;
+  if (!rel) {
+    btnLabel.textContent = tag || '—';
+    chg.innerHTML = '<div class="ota-changelog-empty">Select a version above to read its release notes.</div>';
+    updateBtn.disabled = true;
+    otaSelectedRelease = null;
+  } else {
+    otaSelectedRelease = rel;
+    btnLabel.textContent = rel.tag;
+    chg.innerHTML = '<div class="ota-changelog-body">' + otaMdToHtml(rel.body) + '</div>';
+    updateBtn.disabled = !rel.asset;
+  }
+  Array.prototype.forEach.call(menu.children, function(li) {
+    li.setAttribute('aria-selected', li.getAttribute('data-tag') === tag ? 'true' : 'false');
+  });
+}
+
+/* Open / close the version popover. */
+function otaToggleVersionMenu(ev) {
+  if (ev) ev.stopPropagation();
+  otaInitDOM();
+  var menu = otaDOM.menu, btn = otaDOM.btn;
+  if (!menu || !btn) return;
+  var open = menu.hasAttribute('hidden') ? false : true;
+  if (open) otaCloseVersionMenu();
+  else otaOpenVersionMenu();
+}
+function otaOpenVersionMenu() {
+  otaInitDOM();
+  var menu = otaDOM.menu, btn = otaDOM.btn;
+  if (!menu || !btn) return;
+  menu.hidden = false;
+  btn.setAttribute('aria-expanded', 'true');
+}
+function otaCloseVersionMenu() {
+  otaInitDOM();
+  var menu = otaDOM.menu, btn = otaDOM.btn;
+  if (!menu || !btn) return;
+  menu.hidden = true;
+  btn.setAttribute('aria-expanded', 'false');
+}
+
+/* Click handler for the Update... button. Switches to the Direct URL tab
+ * (so the user sees the URL and progress UI), points the URL input at the
+ * selected asset, and kicks off the same download/flash flow that the
+ * "I'm Feeling Adventurous" button uses. */
+function otaUpdateSelected() {
+  if (!otaSelectedRelease || !otaSelectedRelease.asset) return;
+  var url = otaSelectedRelease.asset.url;
+  if (!url) return;
+  otaInitDOM();
+  var urlInput = otaDOM.urlInput || (otaDOM.urlInput = document.getElementById('ota-url-input'));
+  if (urlInput) urlInput.value = url;
+  otaShowStatus('Flashing ' + otaSelectedRelease.tag + '…');
+  otaUrlDownload();
+}
+
+/* Close the version popover when clicking anywhere outside it. */
+document.addEventListener('click', function(e) {
+  otaInitDOM();
+  var menu = otaDOM.menu, btn = otaDOM.btn;
+  if (!menu || menu.hidden) return;
+  if (btn && btn.contains(e.target)) return;
+  if (menu.contains(e.target)) return;
+  otaCloseVersionMenu();
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') otaCloseVersionMenu();
+});
+
+/* Convert a GitHub-flavoured markdown string to safe HTML. We render the
+ * changelog inside our own DOM, so we do a small subset of MD -> HTML:
+ * headings, bold/italic, code spans, fenced code blocks, links, lists,
+ * blockquotes, and horizontal rules. Anything else is kept as plain text
+ * (escaped). This avoids the security and weight of a full markdown
+ * library while staying readable on a phone.
+ *
+ * GitHub release notes are auto-generated and noisy — a leading "# Title",
+ * "## What's Changed", trailing "**Full Changelog**: <url>", and a block
+ * of "New Contributor" / "@user made their first contribution" lines.
+ * The preClean block below strips that boilerplate so the user only sees
+ * the substantive list of changes. */
+function otaMdToHtml(s) {
+  if (!s) return '<em style="color:var(--text-muted)">No changelog provided.</em>';
+  var esc = escHtml(String(s));
+  esc = esc.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  esc = esc.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+  esc = esc.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return esc.replace(/\n/g, '<br>');
+}
+
 /* ── Unified App WebSocket ─────────────────────────────────────── */
 var appWs = null;
 var wsReconnectTimer = null;
@@ -2887,6 +3362,14 @@ function connectWs() {
     if (document.hidden) {
       try { appWs.send('pause'); } catch(e) {}
     }
+    /* Run the OTA update check shortly after the WS opens so the rest
+     * of the page (init, status push) has time to settle first. This
+     * catches the "on startup, after higher-priority init" case. */
+    if (typeof otaCheckForUpdateThrottled === 'function') {
+      setTimeout(function() {
+        otaCheckForUpdateThrottled('startup');
+      }, 1500);
+    }
   };
 
   appWs.onmessage = function(ev) {
@@ -2900,6 +3383,13 @@ function connectWs() {
         handleLogData(msg.data || '');
       } else if (msg.type === 'status') {
         loadStatusTab(msg.data);
+        /* The device pushes a status update after any state transition,
+         * including the end of an AS11 (CPAP) data session. Re-check
+         * for OTA updates at that moment so the latest firmware is
+         * reflected without forcing the user to manually refresh. */
+        if (typeof otaCheckForUpdateThrottled === 'function') {
+          otaCheckForUpdateThrottled('post-cpap-status');
+        }
       } else if (msg.type === 'upload') {
         renderUploadProgress(msg.data);
       } else if (msg.type === 'ble') {
